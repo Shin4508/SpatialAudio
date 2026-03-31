@@ -6,6 +6,7 @@ import soundfile as sf
 from IPython.display import Audio
 from matplotlib import pyplot as plt
 
+# input sample mp3 file
 sample, sr = sf.read("sample.mp3")
 print(sr)
 if sample.ndim > 1:
@@ -13,6 +14,7 @@ if sample.ndim > 1:
 
 print(sample.shape)
 
+# separating sound in middle or side
 def midSide(sample):
   left = sample[:, 0]
   right = sample[:, 1]
@@ -20,6 +22,8 @@ def midSide(sample):
   side = (left - right) / 2
   return mid, side
 
+# Splitting high tone and low tone 
+# for not to apply HRTF on low tone
 def crossover_split(sound, sr, cutoff_freq=200):
     """
     指定した周波数(cutoff_freq)で、音を「低音成分」と「高音成分」に分割する関数
@@ -37,6 +41,8 @@ def crossover_split(sound, sr, cutoff_freq=200):
 
     return low_band * 4.0, high_band
 
+# Applying HRTF function 
+# in order to do several angle using dictionaries
 def audio_position(arr1, arr2, data1, data2, sound):
 
   dict1 = {}
@@ -54,6 +60,8 @@ def audio_position(arr1, arr2, data1, data2, sound):
 
   return dict1, dict2
 
+# applying EQ to low tone sound
+# low tone sound detector
 def get_low_shelf_coeffs(sr, f0, gain_db, q=0.707):
     """
     Audio EQ Cookbookの式に基づいたLow-Shelfフィルター係数の計算
@@ -73,44 +81,51 @@ def get_low_shelf_coeffs(sr, f0, gain_db, q=0.707):
     a2 = (A + 1) + (A - 1) * cos_w0 - sqrt_A_alpha_2
 
     return [b0, b1, b2], [a0, a1, a2]
+
+# Applying EQ 
 def apply_active_eq(sound, sr, target_freq=120):
-  # 1. 音量解析 (RMS)
+  # 1. RMS
   rms = np.sqrt(np.mean(sound**2))
 
-  # 2. ブースト量の決定
-  # 音が小さい(0.01以下)時に最大+6dB、大きい時に0dBへ
+  # 2. Boosting
   threshold = 0.05
   gain_db = 6.0 * max(0, 1.0 - (rms / threshold)) if rms < threshold else 0.0
 
-  # 3. Low-Shelf 係数の取得
+  # 3. Low-Shelf value
   b, a = get_low_shelf_coeffs(sr, target_freq, gain_db)
 
-  # 4. フィルタリング実行
+  # 4. Filtering
   return signal.lfilter(b, a, sound)
 
+# middle sound and side sound
 mid, side = midSide(sample)
 
+# increase the sound in side for sense of presence
 side = side * 1.5
 
+# Adding and substract for left and right coherence
 left = mid + side
 right = mid - side
 
 mid_side = np.vstack([left, right]).T
-# 保存
+# save
 sf.write("mid_side.mp3", mid_side, sr)
 
+# HRTF data
 data_horizontal = loadmat("small_pinna_final.mat")
 data_frontal = loadmat("small_pinna_frontal.mat")
 
+# Applying EQ
 mid = apply_active_eq(mid, sr)
 side = apply_active_eq(side, sr)
 
+# Excluding mid_low from HRTF
 mid_low, mid_high = crossover_split(mid, sr, cutoff_freq=120)
 
 mid_left, mid_right = audio_position([9, 63], [48], data_horizontal, data_frontal, mid_high)
 side_left, side_right = audio_position([36], [48], data_horizontal, data_frontal, side)
 
-# 1. ゼロ埋め（長さ揃え）するための関数をここで定義しておく
+# standardize the length of files
 def pad(data, length):
     return np.pad(data, (0, length - len(data)), 'constant')
 
@@ -122,14 +137,15 @@ for j in range(len(side_left)):
 
 max_len_hrtf = max(all_lengths)
 
-# 3. 空っぽ（ゼロ）の配列を用意する
+# prepareing zeros in nparray
 left_sum = np.zeros(max_len_hrtf)
 right_sum = np.zeros(max_len_hrtf)
 
-# 4. すべて max_len_hrtf に長さを揃えながら足していく！
+# standardizeing the length and adding the value at the same time
 left_sum += pad(mid_low, max_len_hrtf)
 right_sum += pad(mid_low, max_len_hrtf)
 
+# Summing up the value of HRTF
 for i in range(len(mid_left)):
   left_sum += pad(mid_left[i]["left"+str(i)], max_len_hrtf)
   right_sum += pad(mid_right[i]["right"+str(i)], max_len_hrtf)
@@ -139,18 +155,19 @@ for j in range(len(side_left)):
   # 【重要】右耳のSideは「引く」！
   right_sum -= pad(side_right[j]["right"+str(j)], max_len_hrtf)
 
+# for not to have clipping sound limitting the amplitude
 max_val = np.max(np.abs([left_sum, right_sum]))
 if max_val > 0:
   left_sum = left_sum / max_val
   right_sum = right_sum / max_val
 
 stereo = np.vstack([left_sum, right_sum]).T
-# 保存
+# save
 sf.write("hrtf.mp3", stereo, sr)
 
 def add_reflection(source, data_h, sr, reflect_idx, delay_ms=20, gain=0.4, cutoff_hz=3000):
   delay_samples = int(sr * (delay_ms / 1000))
-    # 遅延させた音源
+    # delayed sound
   reflected_source = np.zeros(len(source) + delay_samples)
   reflected_source[delay_samples:] = source * gain
 
@@ -159,17 +176,19 @@ def add_reflection(source, data_h, sr, reflect_idx, delay_ms=20, gain=0.4, cutof
   b, a = signal.butter(1, normal_cutoff, btype='low', analog=False)
   reflected_source = signal.lfilter(b, a, reflected_source)
 
-    # 反射音のHRTF適用
+    # HRTF for delayed sound
   reflect_l = fftconvolve(reflected_source, data_h["left"][:, reflect_idx], mode="full")
   reflect_r = fftconvolve(reflected_source, data_h["right"][:, reflect_idx], mode="full")
   return reflect_l, reflect_r
 
-# 反射音を左右別々に作る
+# making different reflection for both ears
 ref_r_l, ref_r_r = add_reflection(side, data_horizontal, sr, reflect_idx=27, delay_ms=18)
 ref_l_l, ref_l_r = add_reflection(side, data_horizontal, sr, reflect_idx=45, delay_ms=23)
-# 全ての長さを揃えて足す
+
+# standardizing the length
 max_len = max(len(left_sum), len(ref_r_l), len(ref_l_l))
 
+# padding function for standardizing
 def pad(data, length):
     return np.pad(data, (0, length - len(data)), 'constant')
 
@@ -179,12 +198,13 @@ final_r = pad(right_sum, max_len) + pad(ref_r_r, max_len) + pad(ref_l_r, max_len
 
 audio_final = np.vstack([final_l, final_r]).T
 
-#処理後の音源に倍率をかけて全体をガッツリ持ち上げる
+# Amplifying the sound
 audio_final = audio_final * 1.5
 
+# applying tanh for avoiding clipping sound
 audio_final = np.tanh(audio_final)
 
-# 保存
+# save
 sf.write("final.mp3", audio_final, sr)
 
 plt.plot(sample)
