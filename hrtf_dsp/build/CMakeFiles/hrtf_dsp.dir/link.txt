@@ -1,0 +1,1 @@
+/opt/homebrew/bin/arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -T/Users/yagishitasaruichi/projects/Software/spatial_sound/hrtf_dsp/stm32h723zg.ld -Wl,--gc-sections --specs=nosys.specs CMakeFiles/hrtf_dsp.dir/src/main.c.obj -o hrtf_dsp
