@@ -175,7 +175,7 @@ def run_audio_pipeline(input_signal, sr, data_hz, data_fr, use_hrtf=True):
     # Even you hear from one side there is delay sound to the other side ear
     cross_delay_l = RealTimeDelayLine(sr, delay_ms=0.5, gain=1.0, cutoff_hz=1000)
     cross_delay_r = RealTimeDelayLine(sr, delay_ms=0.5, gain=1.0, cutoff_hz=1000)
-    cross_feed_level = 0.05
+    cross_feed_level = 0.04
 
     # cut off high tone (higher thatn 9000 Hz)
     b_lp, a_lp = signal.butter(2, 6000 / (0.5 * sr), btype="low")
@@ -189,7 +189,7 @@ def run_audio_pipeline(input_signal, sr, data_hz, data_fr, use_hrtf=True):
 
     # ★ 空間オーディオのブレンド率 (1.0で空間全振り、0.0でノーマル)
     # 友達の好みに合わせて 0.5 ~ 0.8 あたりでチューニングするのがおすすめ！
-    alpha = 0.5
+    alpha = 0.8
 
     # 128サンプルずつのブロック処理ループ
     for i in range(0, total_samples, BLOCK_SIZE):
