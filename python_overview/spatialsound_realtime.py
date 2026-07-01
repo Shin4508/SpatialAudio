@@ -189,7 +189,7 @@ def run_audio_pipeline(input_signal, sr, data_hz, data_fr, use_hrtf=True):
 
     # ★ 空間オーディオのブレンド率 (1.0で空間全振り、0.0でノーマル)
     # 友達の好みに合わせて 0.5 ~ 0.8 あたりでチューニングするのがおすすめ！
-    alpha = 0.8
+    alpha = 0.7
 
     # 128サンプルずつのブロック処理ループ
     for i in range(0, total_samples, BLOCK_SIZE):
