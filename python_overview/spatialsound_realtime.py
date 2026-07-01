@@ -175,7 +175,7 @@ def run_audio_pipeline(input_signal, sr, data_hz, data_fr, use_hrtf=True):
     # Even you hear from one side there is delay sound to the other side ear
     cross_delay_l = RealTimeDelayLine(sr, delay_ms=0.5, gain=1.0, cutoff_hz=1000)
     cross_delay_r = RealTimeDelayLine(sr, delay_ms=0.5, gain=1.0, cutoff_hz=1000)
-    cross_feed_level = 0.04
+    cross_feed_level = 0.06
 
     # cut off high tone (higher thatn 9000 Hz)
     b_lp, a_lp = signal.butter(2, 6000 / (0.5 * sr), btype="low")
@@ -206,7 +206,7 @@ def run_audio_pipeline(input_signal, sr, data_hz, data_fr, use_hrtf=True):
         # --- 空間オーディオ処理パイプライン ---
         # 1. Mid / Side 分解
         mid = (block[:, 0] + block[:, 1]) / 2
-        side = (block[:, 0] - block[:, 1]) / 2
+        side = (block[:, 0] - block[:, 1]) * 0.8 / 2
 
         # 2. Active EQ
         mid = eq_mid.process(mid)
