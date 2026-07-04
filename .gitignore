@@ -1,3 +1,10 @@
 data/
 .DS_Store
 Target/
+hrtf_left_9.wav
+hrtf_right_9.wav
+hrtf_left_63.wav
+hrtf_right_9.wav
+hrtf_left_40.wav
+hrtf_right_32.wav
+output.wav
