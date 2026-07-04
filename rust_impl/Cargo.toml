@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 cpal = "0.15"
 ndarray = "0.17"
+nalgebra = "0.33"
