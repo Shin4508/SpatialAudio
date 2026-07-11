@@ -259,138 +259,140 @@ impl RealTimeOverlapSave {
 }
 
 // ==========================================
-// 3. メインパイプライン
+// 3. リアルタイム DSP エンジン
 // ==========================================
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ringbuf::HeapRb;
+use ringbuf::traits::{Consumer, Producer, Split};
+use std::process::Command;
 
-pub fn run_audio_pipeline(
-    input_l: &[f32],
-    input_r: &[f32],
-    sr: f32,
-    hrtf_data: &HrtfData, // 仮想のHRTF構造体
-    use_hrtf: bool,
-) -> (Vec<f32>, Vec<f32>) {
-    const BLOCK_SIZE: usize = 128;
-    let total_samples = input_l.len();
+// エフェクトの「状態」を維持するための構造体
+pub struct SpatialAudioEngine {
+    crossover: RealTimeCrossover,
+    eq_mid: RealTimeActiveEQ,
+    eq_side: RealTimeActiveEQ,
+    mid_l_9: RealTimeOverlapSave,
+    mid_r_9: RealTimeOverlapSave,
+    side_l_36: RealTimeOverlapSave,
+    side_r_36: RealTimeOverlapSave,
+    reflect_r_l: RealTimeOverlapSave,
+    reflect_r_r: RealTimeOverlapSave,
+    reflect_l_l: RealTimeOverlapSave,
+    reflect_l_r: RealTimeOverlapSave,
+    delay_r: RealTimeDelayLine,
+    delay_l: RealTimeDelayLine,
+    cross_delay_l: RealTimeDelayLine,
+    cross_delay_r: RealTimeDelayLine,
+    ir_lp_l: RealTimeBiquadFilter,
+    ir_lp_r: RealTimeBiquadFilter,
+    side_shelf_l: RealTimeBiquadFilter,
+    side_shelf_r: RealTimeBiquadFilter,
+}
 
-    let mut out_left = vec![0.0; total_samples];
-    let mut out_right = vec![0.0; total_samples];
+impl SpatialAudioEngine {
+    pub fn new(sr: f32, hrtf_data: &HrtfData, block_size: usize) -> Self {
+        let (b_lp, a_lp) = butter_lowpass_2nd(sr, 6000.0);
+        let (b_sh, a_sh) = get_high_shelf_coeffs(sr, 3000.0, -5.0, 0.707);
 
-    let mut crossover = RealTimeCrossover::new(sr, 120.0);
-    let mut eq_mid = RealTimeActiveEQ::new(sr, 120.0);
-    let mut eq_side = RealTimeActiveEQ::new(sr, 120.0);
-
-    // HRTFや反射のインスタンス化 (※ HrtfData から適宜スライスを渡す想定)
-    let mut mid_l_9 = RealTimeOverlapSave::new(&hrtf_data.left_0, BLOCK_SIZE);
-    let mut mid_r_9 = RealTimeOverlapSave::new(&hrtf_data.right_0, BLOCK_SIZE);
-    let mut side_l_36 = RealTimeOverlapSave::new(&hrtf_data.left_63, BLOCK_SIZE); // Python側の実装に合わせる
-    let mut side_r_36 = RealTimeOverlapSave::new(&hrtf_data.right_9, BLOCK_SIZE);
-
-    let mut reflect_r_l = RealTimeOverlapSave::new(&hrtf_data.left_40, BLOCK_SIZE);
-    let mut reflect_r_r = RealTimeOverlapSave::new(&hrtf_data.right_32, BLOCK_SIZE);
-    let mut reflect_l_l = RealTimeOverlapSave::new(&hrtf_data.left_40, BLOCK_SIZE);
-    let mut reflect_l_r = RealTimeOverlapSave::new(&hrtf_data.right_32, BLOCK_SIZE);
-
-    let mut delay_r = RealTimeDelayLine::new(sr, 18.0, 0.4, 3000.0);
-    let mut delay_l = RealTimeDelayLine::new(sr, 23.0, 0.4, 3000.0);
-    let mut cross_delay_l = RealTimeDelayLine::new(sr, 0.5, 1.0, 1000.0);
-    let mut cross_delay_r = RealTimeDelayLine::new(sr, 0.5, 1.0, 1000.0);
-
-    let (b_lp, a_lp) = butter_lowpass_2nd(sr, 6000.0);
-    let mut ir_lp_l = RealTimeBiquadFilter::new(b_lp, a_lp);
-    let mut ir_lp_r = RealTimeBiquadFilter::new(b_lp, a_lp);
-
-    let (b_sh, a_sh) = get_high_shelf_coeffs(sr, 3000.0, -5.0, 0.707);
-    let mut side_shelf_l = RealTimeBiquadFilter::new(b_sh, a_sh);
-    let mut side_shelf_r = RealTimeBiquadFilter::new(b_sh, a_sh);
-
-    let alpha = 0.7;
-    let cross_feed_level = 0.06;
-
-    for i in (0..total_samples).step_by(BLOCK_SIZE) {
-        let end = usize::min(i + BLOCK_SIZE, total_samples);
-        if end - i < BLOCK_SIZE {
-            break;
-        } // 簡単のため端数は無視
-
-        let block_l = &input_l[i..end];
-        let block_r = &input_r[i..end];
-
-        if !use_hrtf {
-            out_left[i..end].copy_from_slice(block_l);
-            out_right[i..end].copy_from_slice(block_r);
-            continue;
+        Self {
+            crossover: RealTimeCrossover::new(sr, 120.0),
+            eq_mid: RealTimeActiveEQ::new(sr, 85.0),
+            eq_side: RealTimeActiveEQ::new(sr, 85.0),
+            mid_l_9: RealTimeOverlapSave::new(&hrtf_data.left_0, block_size),
+            mid_r_9: RealTimeOverlapSave::new(&hrtf_data.right_0, block_size),
+            side_l_36: RealTimeOverlapSave::new(&hrtf_data.left_63, block_size),
+            side_r_36: RealTimeOverlapSave::new(&hrtf_data.right_9, block_size),
+            reflect_r_l: RealTimeOverlapSave::new(&hrtf_data.left_40, block_size),
+            reflect_r_r: RealTimeOverlapSave::new(&hrtf_data.right_32, block_size),
+            reflect_l_l: RealTimeOverlapSave::new(&hrtf_data.left_40, block_size),
+            reflect_l_r: RealTimeOverlapSave::new(&hrtf_data.right_32, block_size),
+            delay_r: RealTimeDelayLine::new(sr, 18.0, 0.4, 3000.0),
+            delay_l: RealTimeDelayLine::new(sr, 23.0, 0.4, 3000.0),
+            cross_delay_l: RealTimeDelayLine::new(sr, 0.5, 1.0, 1000.0),
+            cross_delay_r: RealTimeDelayLine::new(sr, 0.5, 1.0, 1000.0),
+            ir_lp_l: RealTimeBiquadFilter::new(b_lp, a_lp),
+            ir_lp_r: RealTimeBiquadFilter::new(b_lp, a_lp),
+            side_shelf_l: RealTimeBiquadFilter::new(b_sh, a_sh),
+            side_shelf_r: RealTimeBiquadFilter::new(b_sh, a_sh),
         }
+    }
 
-        // 1. Mid / Side 分解
-        let mid: Vec<f32> = block_l
+    // 1ブロック分のリアルタイム処理
+    pub fn process_block(&mut self, input_l: &[f32], input_r: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let alpha = 0.7;
+        let cross_feed_level = 0.06;
+
+        let mid: Vec<f32> = input_l
             .iter()
-            .zip(block_r)
+            .zip(input_r)
             .map(|(l, r)| (l + r) / 2.0)
             .collect();
-        let side: Vec<f32> = block_l
+        let side: Vec<f32> = input_l
             .iter()
-            .zip(block_r)
+            .zip(input_r)
             .map(|(l, r)| (l - r) * 0.8 / 2.0)
             .collect();
 
-        // 2. Active EQ
-        let mid_eq = eq_mid.process(&mid);
-        let side_eq = eq_side.process(&side);
+        let mid_eq = self.eq_mid.process(&mid);
+        let side_eq = self.eq_side.process(&side);
+        let (mid_low, mid_high) = self.crossover.process(&mid_eq);
 
-        // 3. Crossover
-        let (mid_low, mid_high) = crossover.process(&mid_eq);
-
-        // 4. HRTF 畳み込み
-        let mh_l = mid_l_9
+        let mh_l = self
+            .mid_l_9
             .process(&mid_high)
             .iter()
             .map(|&x| x * 0.85)
             .collect::<Vec<_>>();
-        let mh_r = mid_r_9
+        let mh_r = self
+            .mid_r_9
             .process(&mid_high)
             .iter()
             .map(|&x| x * 0.85)
             .collect::<Vec<_>>();
 
-        let mut s_l = side_l_36
+        let mut s_l = self
+            .side_l_36
             .process(&side_eq)
             .iter()
             .map(|&x| x * 0.6)
             .collect::<Vec<_>>();
-        let mut s_r = side_r_36
+        let mut s_r = self
+            .side_r_36
             .process(&side_eq)
             .iter()
             .map(|&x| x * 0.6)
             .collect::<Vec<_>>();
-        s_l = side_shelf_l
+        s_l = self
+            .side_shelf_l
             .process(&s_l)
             .iter()
             .map(|&x| x * 1.2)
             .collect();
-        s_r = side_shelf_r
+        s_r = self
+            .side_shelf_r
             .process(&s_r)
             .iter()
             .map(|&x| x * 1.2)
             .collect();
 
-        // 5. 初期反射音の生成
-        let ref_r_source = delay_r.process(&mid_eq);
-        let ref_l_source = delay_l.process(&mid_eq);
+        let ref_r_source = self.delay_r.process(&mid_eq);
+        let ref_l_source = self.delay_l.process(&mid_eq);
 
-        let er_l: Vec<f32> = reflect_r_l
+        let er_l: Vec<f32> = self
+            .reflect_r_l
             .process(&ref_r_source)
             .iter()
-            .zip(reflect_l_l.process(&ref_l_source))
+            .zip(self.reflect_l_l.process(&ref_l_source))
             .map(|(r, l)| r + l)
             .collect();
-        let er_r: Vec<f32> = reflect_r_r
+        let er_r: Vec<f32> = self
+            .reflect_r_r
             .process(&ref_r_source)
             .iter()
-            .zip(reflect_l_r.process(&ref_l_source))
+            .zip(self.reflect_l_r.process(&ref_l_source))
             .map(|(r, l)| r + l)
             .collect();
 
-        // 6. Wet統合
         let wet_l: Vec<f32> = mid_low
             .iter()
             .enumerate()
@@ -402,37 +404,37 @@ pub fn run_audio_pipeline(
             .map(|(idx, &m_low)| (m_low + mh_r[idx] - s_r[idx] + er_r[idx]) * 0.6)
             .collect();
 
-        let wet_l_filtered = ir_lp_l.process(&wet_l);
-        let wet_r_filtered = ir_lp_r.process(&wet_r);
+        let wet_l_filtered = self.ir_lp_l.process(&wet_l);
+        let wet_r_filtered = self.ir_lp_r.process(&wet_r);
 
-        // 7 & 8. 線形ブレンドとクロスフィード
         let final_l: Vec<f32> = wet_l_filtered
             .iter()
-            .zip(block_l)
+            .zip(input_l)
             .map(|(&w, &d)| (alpha * w) + ((1.0 - alpha) * d))
             .collect();
         let final_r: Vec<f32> = wet_r_filtered
             .iter()
-            .zip(block_r)
+            .zip(input_r)
             .map(|(&w, &d)| (alpha * w) + ((1.0 - alpha) * d))
             .collect();
 
-        let g_delayed_l = cross_delay_l.process(&final_l);
-        let g_delayed_r = cross_delay_r.process(&final_r);
+        let g_delayed_l = self.cross_delay_l.process(&final_l);
+        let g_delayed_r = self.cross_delay_r.process(&final_r);
 
-        // 9. 非線形クリッピング
-        for j in 0..BLOCK_SIZE {
+        let mut out_left = vec![0.0; input_l.len()];
+        let mut out_right = vec![0.0; input_r.len()];
+
+        for j in 0..input_l.len() {
             let mixed_l = final_l[j] + (g_delayed_r[j] * cross_feed_level);
             let mixed_r = final_r[j] + (g_delayed_l[j] * cross_feed_level);
-            out_left[i + j] = (mixed_l * 0.85).tanh();
-            out_right[i + j] = (mixed_r * 0.85).tanh();
+            out_left[j] = (mixed_l * 1.2).tanh();
+            out_right[j] = (mixed_r * 1.2).tanh();
         }
-    }
 
-    (out_left, out_right)
+        (out_left, out_right)
+    }
 }
 
-// HRTFのインパルス応答を保持するダミー構造体
 pub struct HrtfData {
     pub left_0: Vec<f32>,
     pub right_0: Vec<f32>,
@@ -441,80 +443,125 @@ pub struct HrtfData {
     pub left_40: Vec<f32>,
     pub right_32: Vec<f32>,
 }
-// --- 前回のコード (run_audio_pipeline や 構造体の定義) はここにある想定 ---
 
-use hound;
-
-fn main() {
-    println!("🚀 テスト実行を開始します...");
-
-    // 1. サンプル音源の読み込み (WAV形式に変換済みのものを使用)
-    let mut reader = hound::WavReader::open("spatial_sound/data/ouput.wav")
-        .expect("サンプルのWAVファイルが見つかりません。");
-    let spec = reader.spec();
-    let sr = spec.sample_rate as f32;
-
-    // ステレオ(Interleaved: L, R, L, R...)のi16データを、LとRのf32配列に分離する(-1.0 ~ 1.0に正規化)
-    let mut input_l = Vec::new();
-    let mut input_r = Vec::new();
-
-    let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
-    for chunk in samples.chunks(2) {
-        if chunk.len() == 2 {
-            input_l.push(chunk[0] as f32 / i16::MAX as f32);
-            input_r.push(chunk[1] as f32 / i16::MAX as f32);
+fn load_impulse_response(filename: &str) -> Vec<f32> {
+    let mut reader = match hound::WavReader::open(filename) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("❌ エラー: HRTFファイル '{}' が見つかりません！", filename);
+            // 見つからない場合は無音のダミーを返してパニックを防ぐ
+            return vec![0.0; 256];
         }
-    }
-    println!("✅ 音源ロード完了: {} Hz, {} サンプル", sr, input_l.len());
-
-    // 2. HRTFデータの準備
-    // ※ 実際はここで "hrtf_left_9.wav" などのWAVファイルからインパルス応答を読み込みます。
-    // 今回はテスト実行を回すため、ダミーの配列（すべて0.0）で構造体を初期化します。
-    let hrtf_data = HrtfData {
-        left_0: load_impulse_response("spatial_sound/data/hrtf_left_9.wav")
-            .unwrap_or(vec![0.0; 512]),
-        right_0: load_impulse_response("spatial_sound/data/hrtf_right_9.wav")
-            .unwrap_or(vec![0.0; 512]),
-        left_63: load_impulse_response("spatial_sound/data/hrtf_left_63.wav")
-            .unwrap_or(vec![0.0; 512]),
-        right_9: load_impulse_response("spatial_sound/data/hrtf_right_9.wav")
-            .unwrap_or(vec![0.0; 512]),
-        left_40: load_impulse_response("spatial_sound/data/hrtf_left_40.wav")
-            .unwrap_or(vec![0.0; 512]),
-        right_32: load_impulse_response("spatial_sound/data/hrtf_right_32.wav")
-            .unwrap_or(vec![0.0; 512]),
     };
-    println!("✅ HRTFデータ準備完了");
 
-    // 3. 空間オーディオパイプラインの実行
-    println!("🎧 空間オーディオ処理を実行中...");
-    let (out_l, out_r) = run_audio_pipeline(&input_l, &input_r, sr, &hrtf_data, true);
+    let samples: Vec<f32> = reader
+        .samples::<f32>()
+        .map(|s| s.expect("サンプルの読み込みに失敗しました"))
+        .collect();
 
-    // 4. 結果をWAVファイルとして書き出し
-    let mut writer =
-        hound::WavWriter::create("final_rt_sim.wav", spec).expect("ファイルの作成に失敗しました。");
-
-    for i in 0..out_l.len() {
-        // f32 (-1.0 ~ 1.0) を i16 に戻す。クリッピング防止でclampする
-        let l_sample = (out_l[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        let r_sample = (out_r[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-
-        writer.write_sample(l_sample).unwrap();
-        writer.write_sample(r_sample).unwrap();
-    }
-    writer
-        .finalize()
-        .expect("ファイルの書き込みに失敗しました。");
-
-    println!("🎉 処理完了！ 'final_rt_sim.wav' として保存しました。");
+    println!(
+        "✅ {} を読み込みました！(長さ: {} サンプル)",
+        filename,
+        samples.len()
+    );
+    samples
 }
 
-// （おまけ）WAVファイルからインパルス応答(モノラル)を読み込むヘルパー関数
-fn load_impulse_response(filename: &str) -> Option<Vec<f32>> {
-    let mut reader = hound::WavReader::open(filename).ok()?;
-    let samples: Vec<f32> = reader
-        .samples::<i16>()
-        .map(|s| s.unwrap() as f32 / i16::MAX as f32)
-        .collect();
-    Some(samples)
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🚀 空間オーディオ DSPエンジン起動...");
+
+    let host = cpal::host_from_id(cpal::HostId::Jack).expect("JACKが動いていません");
+    let input_device = host.default_input_device().expect("入力なし");
+    let output_device = host.default_output_device().expect("出力なし");
+
+    let config: cpal::StreamConfig = output_device.default_output_config()?.into();
+    let sr = config.sample_rate.0 as f32;
+
+    // バッファサイズ（通常PipeWire/JACKは 256 や 512 で回ります）
+    let block_size = 256;
+
+    // リングバッファ（入力を出力スレッドへ渡す土管）
+    let ring = HeapRb::<f32>::new((sr * 0.1) as usize * 2);
+    let (mut producer, mut consumer) = ring.split();
+
+    // DSPエンジンの初期化
+    let hrtf_data = HrtfData {
+        left_0: load_impulse_response("hrtf_left_9.wav"),
+        right_0: load_impulse_response("hrtf_right_9.wav"),
+        left_63: load_impulse_response("hrtf_left_63.wav"),
+        right_9: load_impulse_response("hrtf_right_9.wav"),
+        left_40: load_impulse_response("hrtf_left_40.wav"),
+        right_32: load_impulse_response("hrtf_right_32.wav"),
+    };
+    let mut engine = SpatialAudioEngine::new(sr, &hrtf_data, block_size);
+
+    // 入力ストリーム
+    let input_stream = input_device.build_input_stream(
+        &config,
+        move |data: &[f32], _: &_| {
+            for &s in data {
+                let _ = producer.try_push(s);
+            }
+        },
+        |err| eprintln!("入力エラー: {}", err),
+        None,
+    )?;
+
+    // 一時バッファ
+    let mut buf_l = Vec::with_capacity(block_size);
+    let mut buf_r = Vec::with_capacity(block_size);
+
+    // 出力ストリーム (ここでDSPを回す)
+    let output_stream = output_device.build_output_stream(
+        &config,
+        move |data: &mut [f32], _: &_| {
+            buf_l.clear();
+            buf_r.clear();
+
+            // 必要な分だけリングバッファから取り出す（ステレオなので2個ずつ）
+            for _ in 0..(data.len() / 2) {
+                buf_l.push(consumer.try_pop().unwrap_or(0.0));
+                buf_r.push(consumer.try_pop().unwrap_or(0.0));
+            }
+
+            // DSPエンジンに通す
+            let (out_l, out_r) = engine.process_block(&buf_l, &buf_r);
+
+            // ステレオに再合成して出力
+            for (i, frame) in data.chunks_mut(2).enumerate() {
+                frame[0] = out_l[i];
+                frame[1] = out_r[i];
+            }
+        },
+        |err| eprintln!("出力エラー: {}", err),
+        None,
+    )?;
+
+    input_stream.play()?;
+    output_stream.play()?;
+
+    // 自動結線スクリプト
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let auto_link_script = r#"
+        L_PORT=$(pw-link -io | grep -o 'bluez_input[^:]*:output_FL' | head -n 1)
+        R_PORT=$(pw-link -io | grep -o 'bluez_input[^:]*:output_FR' | head -n 1)
+
+        # 2. ✂️ OSが勝手に繋いだ「直結バイパス」を強制切断（エラーは無視）
+        pw-link -d "$L_PORT" "alsa_output.usb-Creative_Technology_Ltd_Sound_Blaster_Play__3_YDSB1730613003087M-00.analog-stereo:playback_FL" 2>/dev/null || true
+        pw-link -d "$R_PORT" "alsa_output.usb-Creative_Technology_Ltd_Sound_Blaster_Play__3_YDSB1730613003087M-00.analog-stereo:playback_FR" 2>/dev/null || true
+        if [ -n "$L_PORT" ] && [ -n "$R_PORT" ]; then
+            pw-link "$L_PORT" "cpal_client_in:in_0"
+            pw-link "$R_PORT" "cpal_client_in:in_1"
+        fi
+    "#;
+    Command::new("bash")
+        .arg("-c")
+        .arg(auto_link_script)
+        .status()
+        .unwrap();
+
+    println!("🎧 DSP稼働中... (Ctrl+Cで終了)");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
