@@ -292,7 +292,7 @@ pub struct SpatialAudioEngine {
 impl SpatialAudioEngine {
     pub fn new(sr: f32, hrtf_data: &HrtfData, block_size: usize) -> Self {
         let (b_lp, a_lp) = butter_lowpass_2nd(sr, 6000.0);
-        let (b_sh, a_sh) = get_high_shelf_coeffs(sr, 3000.0, -5.0, 0.707);
+        let (b_sh, a_sh) = get_high_shelf_coeffs(sr, 2500.0, -5.0, 0.707);
 
         Self {
             crossover: RealTimeCrossover::new(sr, 120.0),
