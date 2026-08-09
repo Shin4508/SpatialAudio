@@ -145,9 +145,9 @@ def run_audio_pipeline(input_signal, sr, data_hz, data_fr, use_hrtf=True):
     out_right = np.zeros(total_samples)
 
     # make instance
-    crossover = RealTimeCrossover(sr, cutoff_freq=120)
-    eq_mid = RealTimeActiveEQ(sr, target_freq=120)
-    eq_side = RealTimeActiveEQ(sr, target_freq=120)
+    crossover = RealTimeCrossover(sr, cutoff_freq=85)
+    eq_mid = RealTimeActiveEQ(sr, target_freq=85)
+    eq_side = RealTimeActiveEQ(sr, target_freq=85)
 
     # HRTF instance
     mid_l_9 = RealTimeOverlapSaveOverlap(data_hz["left"][:, 0], BLOCK_SIZE)
@@ -183,7 +183,7 @@ def run_audio_pipeline(input_signal, sr, data_hz, data_fr, use_hrtf=True):
     ir_lp_r = RealTimeBiquadFilter(b_lp, a_lp)
 
     # Decrease the high tone ("I heard decrease the high tone make it more comfortable")
-    b_sh, a_sh = get_high_shelf_coeffs(sr, f0=3000, gain_db=-5.0)
+    b_sh, a_sh = get_high_shelf_coeffs(sr, f0=2500, gain_db=-5.0)
     side_shelf_l = RealTimeBiquadFilter(b_sh, a_sh)
     side_shelf_r = RealTimeBiquadFilter(b_sh, a_sh)
 

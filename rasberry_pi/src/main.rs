@@ -3,10 +3,6 @@ use rustfft::{Fft, FftPlanner};
 use std::f32::consts::PI;
 use std::sync::Arc;
 
-// ==========================================
-// 1. フィルタ係数計算
-// ==========================================
-
 fn get_low_shelf_coeffs(sr: f32, f0: f32, gain_db: f32, q: f32) -> ([f32; 3], [f32; 3]) {
     let a = 10.0_f32.powf(gain_db / 40.0);
     let w0 = 2.0 * PI * f0 / sr;
@@ -21,7 +17,6 @@ fn get_low_shelf_coeffs(sr: f32, f0: f32, gain_db: f32, q: f32) -> ([f32; 3], [f
     let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0);
     let a2 = (a + 1.0) + (a - 1.0) * cos_w0 - sqrt_a_alpha_2;
 
-    // RustのBiquad用に a0 で正規化
     ([b0 / a0, b1 / a0, b2 / a0], [1.0, a1 / a0, a2 / a0])
 }
 
@@ -42,7 +37,6 @@ fn get_high_shelf_coeffs(sr: f32, f0: f32, gain_db: f32, q: f32) -> ([f32; 3], [
     ([b0 / a0, b1 / a0, b2 / a0], [1.0, a1 / a0, a2 / a0])
 }
 
-// 簡易的な2次バターワースLPF係数
 fn butter_lowpass_2nd(sr: f32, cutoff: f32) -> ([f32; 3], [f32; 3]) {
     let w0 = 2.0 * PI * cutoff / sr;
     let alpha = w0.sin() / (2.0 * 0.7071); // Q = 1/sqrt(2)
@@ -58,9 +52,20 @@ fn butter_lowpass_2nd(sr: f32, cutoff: f32) -> ([f32; 3], [f32; 3]) {
     ([b0 / a0, b1 / a0, b2 / a0], [1.0, a1 / a0, a2 / a0])
 }
 
-// ==========================================
-// 2. リアルタイム処理クラス群
-// ==========================================
+fn get_peaking_eq_coeffs(sr: f32, f0: f32, gain_db: f32, q: f32) -> ([f32; 3], [f32; 3]) {
+    let a = 10.0_f32.powf(gain_db / 40.0);
+    let w0 = 2.0 * std::f32::consts::PI * f0 / sr;
+    let alpha = w0.sin() / (2.0 * q);
+
+    let b0 = 1.0 + alpha * a;
+    let b1 = -2.0 * w0.cos();
+    let b2 = 1.0 - alpha * a;
+    let a0 = 1.0 + alpha / a;
+    let a1 = -2.0 * w0.cos();
+    let a2 = 1.0 - alpha / a;
+
+    ([b0 / a0, b1 / a0, b2 / a0], [1.0, a1 / a0, a2 / a0])
+}
 
 #[derive(Clone)]
 pub struct RealTimeBiquadFilter {
@@ -101,7 +106,6 @@ pub struct RealTimeCrossover {
 impl RealTimeCrossover {
     pub fn new(sr: f32, cutoff_freq: f32) -> Self {
         let (b_lp, a_lp) = butter_lowpass_2nd(sr, cutoff_freq);
-        // HPFはLPFの係数を元に簡易生成（実用では正確なHPF係数計算を推奨）
         let mut b_hp = b_lp;
         b_hp[0] = (1.0 + b_lp[0]) / 2.0;
         b_hp[1] = -(1.0 + b_lp[0]);
@@ -139,7 +143,7 @@ impl RealTimeActiveEQ {
     pub fn process(&mut self, block: &[f32]) -> Vec<f32> {
         let rms = (block.iter().map(|&x| x * x).sum::<f32>() / block.len() as f32).sqrt();
         let threshold = 0.05;
-        let gain_db = if rms < threshold {
+        let gain_db = if rms > threshold {
             6.0 * f32::max(0.0, 1.0 - (rms / threshold))
         } else {
             0.0
@@ -231,7 +235,6 @@ impl RealTimeOverlapSave {
     }
 
     pub fn process(&mut self, block: &[f32]) -> Vec<f32> {
-        // バッファを左にシフトし、新しいブロックを末尾に追加
         self.input_buffer.copy_within(self.l.., 0);
         let end_idx = self.fft_size;
         let start_idx = end_idx - self.l;
@@ -245,29 +248,164 @@ impl RealTimeOverlapSave {
 
         self.fft.process(&mut work_buf);
 
-        // 周波数領域での乗算
         for (x, h) in work_buf.iter_mut().zip(self.h_fft.iter()) {
             *x *= *h;
         }
 
         self.ifft.process(&mut work_buf);
 
-        // スケール調整と実部の抽出（最後の L サンプルが有効データ）
         let scale = 1.0 / self.fft_size as f32;
         work_buf[start_idx..].iter().map(|c| c.re * scale).collect()
     }
 }
 
-// ==========================================
-// 3. リアルタイム DSP エンジン
-// ==========================================
+pub struct RoomAcousticAnalyzer {
+    // 平滑化（Smoothing）用パラメータ
+    current_er_pct: f32,
+    current_reverb_pct: f32,
+    smoothing_factor: f32, // 急激なゲイン変化によるノイズ（Zipper Noise）防止
+}
+impl RoomAcousticAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            current_er_pct: 0.5,     // 初期値 50%
+            current_reverb_pct: 0.5, // 初期値 50%
+            smoothing_factor: 0.05,  // 5% ずつ滑らかに追従
+        }
+    }
+
+    /// ブロック単位で音源の空間成分量を分析し、補正適用率(0.0 ~ 1.0)を算出
+    pub fn analyze(&mut self, block: &[f32]) -> (f32, f32) {
+        if block.is_empty() {
+            return (self.current_er_pct, self.current_reverb_pct);
+        }
+
+        // RMS（全体エネルギー）
+        let rms = (block.iter().map(|&x| x * x).sum::<f32>() / block.len() as f32).sqrt();
+        if rms < 0.001 {
+            // 無音時は現状維持
+            return (self.current_er_pct, self.current_reverb_pct);
+        }
+
+        // 簡易過渡応答（Transient）/ 初期反射エネルギーの短時間推定
+        // アタック直後（数ms〜20ms）のローカルピークと全体エネルギーの比率を見る
+        let sub_block_size = block.len() / 4;
+        let mut sub_rms = [0.0f32; 4];
+        for i in 0..4 {
+            let start = i * sub_block_size;
+            let end = start + sub_block_size;
+            sub_rms[i] = (block[start..end].iter().map(|&x| x * x).sum::<f32>()
+                / sub_block_size as f32)
+                .sqrt();
+        }
+
+        // アタック後の減衰傾斜から初期反射（ER）とDRRの不足度を簡易算出
+        let transient_ratio = sub_rms[0] / (rms + 1e-6);
+
+        // ターゲットパーセンテージの算出ロジック:
+        // アタックが鋭く(ドライ音源)減衰が急な場合 ＝ 反響・リバーブが足りないと判断して適用率を上げる
+        let target_er_pct = if transient_ratio > 1.5 {
+            0.85 // ドライすぎる音源 -> アーリー反射を85%まで足す
+        } else {
+            0.30 // もともと残響が含まれる音源 -> アーリー反射は30%に抑える
+        };
+
+        let target_reverb_pct = if sub_rms[3] / (sub_rms[0] + 1e-6) < 0.1 {
+            0.70 // テイル（余韻）が全くない -> リバーブを70%付与
+        } else {
+            0.20 // 十分な余韻がある -> リバーブ付与を20%に下げる
+        };
+
+        // 一位ローパスフィルタで滑らかにパラメータを更新 (Zipper Noise防止)
+        self.current_er_pct += (target_er_pct - self.current_er_pct) * self.smoothing_factor;
+        self.current_reverb_pct +=
+            (target_reverb_pct - self.current_reverb_pct) * self.smoothing_factor;
+
+        (self.current_er_pct, self.current_reverb_pct)
+    }
+}
+
+pub struct DistanceFilter {
+    sr: f32,
+    low_shelf: RealTimeBiquadFilter,
+    high_shelf: RealTimeBiquadFilter,
+    current_distance: f32,
+}
+
+impl DistanceFilter {
+    pub fn new(sr: f32) -> Self {
+        // 初期状態は 1.0m (標準距離)
+        let (b_ls, a_ls) = get_low_shelf_coeffs(sr, 200.0, 0.0, 0.707);
+        let (b_hs, a_hs) = get_high_shelf_coeffs(sr, 6000.0, 0.0, 0.707);
+
+        Self {
+            sr,
+            low_shelf: RealTimeBiquadFilter::new(b_ls, a_ls),
+            high_shelf: RealTimeBiquadFilter::new(b_hs, a_hs),
+            current_distance: 1.0,
+        }
+    }
+
+    /// 距離 d (m) に基づいてフィルタパラメータを自動計算・更新し、ブロック処理を行う
+    pub fn process(&mut self, block: &[f32], target_distance_m: f32) -> Vec<f32> {
+        // 距離の急変を防ぐスムージング (0.1m 未満にならないようクランプ)
+        let d = target_distance_m.max(0.1);
+        self.current_distance += (d - self.current_distance) * 0.05;
+        let dist = self.current_distance;
+
+        // ----------------------------------------------------
+        // 1. 近接効果キャンセル (200Hz 以下の Low-shelf 減衰)
+        // ----------------------------------------------------
+        // オンマイク(0.05m〜0.2m)ほど低域が高く録られているため、
+        // 離れるほど(d -> 離脱)近接効果分をカットしてフラットに戻す。
+        // d = 0.1m で 0dB, d = 1.0m で約 -6dB, d = 3.0m 以上で最大 -9dB カット
+        let proximity_gain_db = if dist > 0.1 {
+            -6.0 * (dist / 0.1).log10().clamp(0.0, 1.5) // 最大 -9dB
+        } else {
+            0.0
+        };
+
+        let (b_ls, a_ls) = get_low_shelf_coeffs(self.sr, 180.0, proximity_gain_db, 0.707);
+        self.low_shelf.b = b_ls;
+        self.low_shelf.a = a_ls;
+
+        // ----------------------------------------------------
+        // 2. 空気吸収 (6kHz 以上の High-shelf 減衰)
+        // ----------------------------------------------------
+        // 距離 1m あたり約 -1.5dB 高域が減衰する物理特性を近似
+        let air_absorption_gain_db = -1.5 * (dist - 1.0).max(0.0);
+        let (b_hs, a_hs) = get_high_shelf_coeffs(
+            self.sr,
+            6000.0,
+            air_absorption_gain_db.max(-12.0), // 下限 -12dB
+            0.707,
+        );
+        self.high_shelf.b = b_hs;
+        self.high_shelf.a = a_hs;
+
+        // ----------------------------------------------------
+        // 3. 距離による音量減衰 (1/d 逆二乗則の近似)
+        // ----------------------------------------------------
+        let ref_distance = 0.5; // 基準距離 0.5m
+        let distance_gain = (ref_distance / dist).min(1.0);
+
+        // フィルタ処理実行
+        let low_filtered = self.low_shelf.process(block);
+        let fully_filtered = self.high_shelf.process(&low_filtered);
+
+        // 距離音量を乗算して出力
+        fully_filtered.iter().map(|&x| x * distance_gain).collect()
+    }
+}
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Producer, Split};
 use std::process::Command;
 
-// エフェクトの「状態」を維持するための構造体
 pub struct SpatialAudioEngine {
+    analyzer: RoomAcousticAnalyzer,
+    dist_filter_mid: DistanceFilter,
     crossover: RealTimeCrossover,
     eq_mid: RealTimeActiveEQ,
     eq_side: RealTimeActiveEQ,
@@ -287,17 +425,25 @@ pub struct SpatialAudioEngine {
     ir_lp_r: RealTimeBiquadFilter,
     side_shelf_l: RealTimeBiquadFilter,
     side_shelf_r: RealTimeBiquadFilter,
+    //notch_4k_l: RealTimeBiquadFilter,
+    //notch_4k_r: RealTimeBiquadFilter,
+    //notch_8k_l: RealTimeBiquadFilter,
+    //notch_8k_r: RealTimeBiquadFilter,
 }
 
 impl SpatialAudioEngine {
     pub fn new(sr: f32, hrtf_data: &HrtfData, block_size: usize) -> Self {
         let (b_lp, a_lp) = butter_lowpass_2nd(sr, 6000.0);
-        let (b_sh, a_sh) = get_high_shelf_coeffs(sr, 2500.0, -5.0, 0.707);
+        let (b_sh, a_sh) = get_high_shelf_coeffs(sr, 1700.0, -5.0, 0.707);
+        let (b_peak1, a_peak1) = get_peaking_eq_coeffs(sr, 4000.0, -6.0, 1.5);
+        let (b_peak2, a_peak2) = get_peaking_eq_coeffs(sr, 7500.0, -6.0, 1.5);
 
         Self {
-            crossover: RealTimeCrossover::new(sr, 120.0),
-            eq_mid: RealTimeActiveEQ::new(sr, 85.0),
-            eq_side: RealTimeActiveEQ::new(sr, 85.0),
+            analyzer: RoomAcousticAnalyzer::new(),
+            crossover: RealTimeCrossover::new(sr, 100.0),
+            dist_filter_mid: DistanceFilter::new(sr),
+            eq_mid: RealTimeActiveEQ::new(sr, 80.0),
+            eq_side: RealTimeActiveEQ::new(sr, 80.0),
             mid_l_9: RealTimeOverlapSave::new(&hrtf_data.left_0, block_size),
             mid_r_9: RealTimeOverlapSave::new(&hrtf_data.right_0, block_size),
             side_l_36: RealTimeOverlapSave::new(&hrtf_data.left_63, block_size),
@@ -314,19 +460,36 @@ impl SpatialAudioEngine {
             ir_lp_r: RealTimeBiquadFilter::new(b_lp, a_lp),
             side_shelf_l: RealTimeBiquadFilter::new(b_sh, a_sh),
             side_shelf_r: RealTimeBiquadFilter::new(b_sh, a_sh),
+            //notch_4k_l: RealTimeBiquadFilter::new(b_peak1, a_peak1),
+            //notch_4k_r: RealTimeBiquadFilter::new(b_peak1, a_peak1),
+            //notch_8k_l: RealTimeBiquadFilter::new(b_peak2, a_peak2),
+            //notch_8k_r: RealTimeBiquadFilter::new(b_peak2, a_peak2),
         }
     }
 
-    // 1ブロック分のリアルタイム処理
-    pub fn process_block(&mut self, input_l: &[f32], input_r: &[f32]) -> (Vec<f32>, Vec<f32>) {
-        let alpha = 0.7;
-        let cross_feed_level = 0.06;
+    pub fn process_block(
+        &mut self,
+        input_l: &[f32],
+        input_r: &[f32],
+        target_distance_m: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let alpha = 1.0;
+        let cross_feed_level = 0.3;
 
-        let mid: Vec<f32> = input_l
+        let raw_mid: Vec<f32> = input_l
             .iter()
             .zip(input_r)
             .map(|(l, r)| (l + r) / 2.0)
             .collect();
+
+        let mid = self.dist_filter_mid.process(&raw_mid, target_distance_m);
+
+        let (mut er_pct, mut reverb_pct) = self.analyzer.analyze(&mid);
+
+        let distance_factor = 1.0 + (target_distance_m - 0.5) * 0.4;
+        er_pct = (er_pct * distance_factor).clamp(0.0, 1.0);
+        reverb_pct = (reverb_pct * distance_factor).clamp(0.0, 1.0);
+
         let side: Vec<f32> = input_l
             .iter()
             .zip(input_r)
@@ -393,19 +556,47 @@ impl SpatialAudioEngine {
             .map(|(r, l)| r + l)
             .collect();
 
+        let side_er_l: Vec<f32> = self
+            .reflect_r_l
+            .process(&ref_r_source)
+            .iter()
+            .zip(self.reflect_l_l.process(&ref_l_source))
+            .map(|(r, l)| r + l)
+            .collect();
+        let side_er_r: Vec<f32> = self
+            .reflect_r_r
+            .process(&ref_r_source)
+            .iter()
+            .zip(self.reflect_l_r.process(&ref_l_source))
+            .map(|(r, l)| r + l)
+            .collect();
+
         let wet_l: Vec<f32> = mid_low
             .iter()
             .enumerate()
-            .map(|(idx, &m_low)| (m_low + mh_l[idx] + s_l[idx] + er_l[idx]) * 0.6)
+            .map(|(idx, &m_low)| {
+                let er_component = (er_l[idx] + side_er_l[idx]) * er_pct;
+                let tail_component = ref_l_source[idx] * 0.3 * reverb_pct;
+                (m_low + mh_l[idx] + s_l[idx] + er_component + tail_component) * 0.6
+            })
             .collect();
         let wet_r: Vec<f32> = mid_low
             .iter()
             .enumerate()
-            .map(|(idx, &m_low)| (m_low + mh_r[idx] - s_r[idx] + er_r[idx]) * 0.6)
+            .map(|(idx, &m_low)| {
+                let er_component = (er_r[idx] + side_er_r[idx]) * er_pct;
+                let tail_component = ref_r_source[idx] * 0.3 * reverb_pct;
+                (m_low + mh_r[idx] - s_r[idx] + er_component + tail_component) * 0.6
+            })
             .collect();
 
-        let wet_l_filtered = self.ir_lp_l.process(&wet_l);
-        let wet_r_filtered = self.ir_lp_r.process(&wet_r);
+        let mut wet_l_filtered = self.ir_lp_l.process(&wet_l);
+        let mut wet_r_filtered = self.ir_lp_r.process(&wet_r);
+
+        //wet_l_filtered = self.notch_4k_l.process(&wet_l_filtered);
+        //wet_l_filtered = self.notch_8k_l.process(&wet_l_filtered);
+        //wet_r_filtered = self.notch_4k_r.process(&wet_r_filtered);
+        //wet_r_filtered = self.notch_8k_r.process(&wet_r_filtered);
 
         let final_l: Vec<f32> = wet_l_filtered
             .iter()
@@ -427,8 +618,8 @@ impl SpatialAudioEngine {
         for j in 0..input_l.len() {
             let mixed_l = final_l[j] + (g_delayed_r[j] * cross_feed_level);
             let mixed_r = final_r[j] + (g_delayed_l[j] * cross_feed_level);
-            out_left[j] = (mixed_l * 1.2).tanh();
-            out_right[j] = (mixed_r * 1.2).tanh();
+            out_left[j] = (mixed_l * 0.85).tanh();
+            out_right[j] = (mixed_r * 0.85).tanh();
         }
 
         (out_left, out_right)
@@ -449,7 +640,6 @@ fn load_impulse_response(filename: &str) -> Vec<f32> {
         Ok(r) => r,
         Err(_) => {
             eprintln!("❌ エラー: HRTFファイル '{}' が見つかりません！", filename);
-            // 見つからない場合は無音のダミーを返してパニックを防ぐ
             return vec![0.0; 256];
         }
     };
@@ -477,14 +667,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: cpal::StreamConfig = output_device.default_output_config()?.into();
     let sr = config.sample_rate.0 as f32;
 
-    // バッファサイズ（通常PipeWire/JACKは 256 や 512 で回ります）
-    let block_size = 256;
+    let block_size = 1024;
 
-    // リングバッファ（入力を出力スレッドへ渡す土管）
     let ring = HeapRb::<f32>::new((sr * 0.1) as usize * 2);
     let (mut producer, mut consumer) = ring.split();
 
-    // DSPエンジンの初期化
     let hrtf_data = HrtfData {
         left_0: load_impulse_response("hrtf_left_9.wav"),
         right_0: load_impulse_response("hrtf_right_9.wav"),
@@ -495,7 +682,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut engine = SpatialAudioEngine::new(sr, &hrtf_data, block_size);
 
-    // 入力ストリーム
     let input_stream = input_device.build_input_stream(
         &config,
         move |data: &[f32], _: &_| {
@@ -507,27 +693,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     )?;
 
-    // 一時バッファ
     let mut buf_l = Vec::with_capacity(block_size);
     let mut buf_r = Vec::with_capacity(block_size);
 
-    // 出力ストリーム (ここでDSPを回す)
     let output_stream = output_device.build_output_stream(
         &config,
         move |data: &mut [f32], _: &_| {
             buf_l.clear();
             buf_r.clear();
 
-            // 必要な分だけリングバッファから取り出す（ステレオなので2個ずつ）
             for _ in 0..(data.len() / 2) {
                 buf_l.push(consumer.try_pop().unwrap_or(0.0));
                 buf_r.push(consumer.try_pop().unwrap_or(0.0));
             }
 
-            // DSPエンジンに通す
-            let (out_l, out_r) = engine.process_block(&buf_l, &buf_r);
+            let target_distance_m: f32 = 1.5;
+            let (out_l, out_r) = engine.process_block(&buf_l, &buf_r, target_distance_m);
 
-            // ステレオに再合成して出力
             for (i, frame) in data.chunks_mut(2).enumerate() {
                 frame[0] = out_l[i];
                 frame[1] = out_r[i];
@@ -540,7 +722,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     input_stream.play()?;
     output_stream.play()?;
 
-    // 自動結線スクリプト
     std::thread::sleep(std::time::Duration::from_millis(500));
     let auto_link_script = r#"
         L_PORT=$(pw-link -io | grep -o 'bluez_input[^:]*:output_FL' | head -n 1)
