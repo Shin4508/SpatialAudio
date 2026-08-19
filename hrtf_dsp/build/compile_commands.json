@@ -1,8 +1,0 @@
-[
-{
-  "directory": "/Users/yagishitasaruichi/projects/Software/spatial_sound/hrtf_dsp/build",
-  "command": "/opt/homebrew/bin/arm-none-eabi-gcc   -std=gnu11 -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -O3 -Wall -fdata-sections -ffunction-sections -o CMakeFiles/hrtf_dsp.dir/src/main.c.obj -c /Users/yagishitasaruichi/projects/Software/spatial_sound/hrtf_dsp/src/main.c",
-  "file": "/Users/yagishitasaruichi/projects/Software/spatial_sound/hrtf_dsp/src/main.c",
-  "output": "CMakeFiles/hrtf_dsp.dir/src/main.c.obj"
-}
-]
