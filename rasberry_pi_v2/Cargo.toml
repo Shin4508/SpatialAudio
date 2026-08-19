@@ -1,0 +1,11 @@
+[package]
+name = "rasberry_pi_v2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = {version = "0.15.3", features = ["jack"]}
+ringbuf = "0.4.1"
+rustfft = "6.1"
+num-complex = "0.4"
+hound = "3.5"
