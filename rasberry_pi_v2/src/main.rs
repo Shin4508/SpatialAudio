@@ -859,14 +859,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: cpal::StreamConfig = output_device.default_output_config()?.into();
     let sr = config.sample_rate.0 as f32;
 
-    let block_size = 256;
+    let block_size = 1024;
 
     let ring = HeapRb::<f32>::new((sr * 0.1) as usize * 2);
     let (mut producer, mut consumer) = ring.split();
 
     let hrtf_data = HrtfData {
-        mid_front_l: load_impulse_response("hrtf_left_0.wav"),
-        mid_front_r: load_impulse_response("hrtf_right_0.wav"),
+        mid_front_l: load_impulse_response("hrtf_0.wav"),
+        mid_front_r: load_impulse_response("hrtf_0.wav"),
         side_front_l: load_impulse_response("hrtf_left_63.wav"),
         side_front_r: load_impulse_response("hrtf_right_9.wav"),
         rear_left: load_impulse_response("hrtf_left_40.wav"),

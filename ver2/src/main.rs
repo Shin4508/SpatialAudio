@@ -317,6 +317,8 @@ impl FdnDelay {
 }
 
 pub struct StereoFdnReverb {
+    pre_delay_mid: RealTimeDelayLine,
+    pre_delay_side: RealTimeDelayLine,
     delays: [FdnDelay; 4],
     feedback: f32,
     damping_alpha: f32,
@@ -333,16 +335,20 @@ impl StereoFdnReverb {
 
         // One-pole damping inside the feedback loop. Late reverberation is
         // intentionally darker than the direct HRTF / early-reflection field.
-        let damping_cutoff_hz = 5500.0_f32;
+        let damping_cutoff_hz = 5000.0_f32;
         let damping_alpha = 1.0 - (-2.0 * PI * damping_cutoff_hz / sr).exp();
 
         Self {
+            // Keep the late field perceptually separate from the discrete ER cluster.
+            // The FDN begins after the last strong early reflection.
+            pre_delay_mid: RealTimeDelayLine::new(sr, 55.0, 1.0, 12000.0),
+            pre_delay_side: RealTimeDelayLine::new(sr, 55.0, 1.0, 12000.0),
             delays,
-            feedback: 0.78,
+            feedback: 0.72,
             damping_alpha,
-            mid_input_gain: 0.32,
-            side_input_gain: 0.22,
-            output_gain: 0.55,
+            mid_input_gain: 0.18,
+            side_input_gain: 0.10,
+            output_gain: 0.28,
         }
     }
 
@@ -358,7 +364,11 @@ impl StereoFdnReverb {
         let mid_pattern = [1.0_f32, 1.0, 1.0, 1.0];
         let side_pattern = [1.0_f32, -1.0, -1.0, 1.0];
 
-        for (&m, &s) in mid.iter().zip(side.iter()).take(n) {
+        // Late-field pre-delay: discrete ER occupies the first ~50 ms.
+        let pred_mid = self.pre_delay_mid.process(&mid[..n]);
+        let pred_side = self.pre_delay_side.process(&side[..n]);
+
+        for (&m, &s) in pred_mid.iter().zip(pred_side.iter()) {
             let mut d = [0.0_f32; 4];
             for (i, delay) in self.delays.iter_mut().enumerate() {
                 d[i] = delay.read_damped(self.damping_alpha);
@@ -452,6 +462,54 @@ impl RealTimeOverlapSave {
     }
 }
 
+/// One discrete early-reflection event.
+///
+/// Each event has its own delay, wall-loss low-pass, gain and cross-ear HRIR pair.
+/// Side is injected with a sign chosen from the event's horizontal hemisphere so
+/// that the original M/S stage width contributes without turning ER into a second
+/// full-strength stereo image.
+pub struct EarlyReflection {
+    delay: RealTimeDelayLine,
+    to_left: RealTimeOverlapSave,
+    to_right: RealTimeOverlapSave,
+    side_sign: f32,
+    side_mix: f32,
+}
+
+impl EarlyReflection {
+    pub fn new(
+        sr: f32,
+        block_size: usize,
+        delay_ms: f32,
+        gain: f32,
+        cutoff_hz: f32,
+        side_sign: f32,
+        hrir_left: &[f32],
+        hrir_right: &[f32],
+    ) -> Self {
+        Self {
+            delay: RealTimeDelayLine::new(sr, delay_ms, gain, cutoff_hz),
+            to_left: RealTimeOverlapSave::new(hrir_left, block_size),
+            to_right: RealTimeOverlapSave::new(hrir_right, block_size),
+            side_sign,
+            side_mix: 0.45,
+        }
+    }
+
+    pub fn process(&mut self, mid: &[f32], side: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let n = mid.len().min(side.len());
+        let mut source = Vec::with_capacity(n);
+        for i in 0..n {
+            source.push(mid[i] + side[i] * self.side_sign * self.side_mix);
+        }
+
+        let delayed = self.delay.process(&source);
+        let left = self.to_left.process(&delayed);
+        let right = self.to_right.process(&delayed);
+        (left, right)
+    }
+}
+
 pub struct RoomAcousticAnalyzer {
     // 平滑化（Smoothing）用パラメータ
     current_er_pct: f32,
@@ -461,8 +519,8 @@ pub struct RoomAcousticAnalyzer {
 impl RoomAcousticAnalyzer {
     pub fn new() -> Self {
         Self {
-            current_er_pct: 0.5,
-            current_reverb_pct: 0.5,
+            current_er_pct: 0.22,
+            current_reverb_pct: 0.18,
             smoothing_factor: 0.05,
         }
     }
@@ -505,11 +563,11 @@ impl RoomAcousticAnalyzer {
 
         let transient_ratio = sub_rms[0] / (rms + 1e-6);
         // Keep ER audible even on steady program material.
-        let target_er_pct = if transient_ratio > 1.5 { 0.85 } else { 0.45 };
+        let target_er_pct = if transient_ratio > 1.5 { 0.35 } else { 0.22 };
 
         let tail_ratio = sub_rms[3] / (sub_rms[0] + 1e-6);
         // The old 0.20 baseline buried the FDN under the direct field.
-        let target_reverb_pct = if tail_ratio < 0.1 { 0.70 } else { 0.35 };
+        let target_reverb_pct = if tail_ratio < 0.1 { 0.30 } else { 0.18 };
 
         self.current_er_pct += (target_er_pct - self.current_er_pct) * self.smoothing_factor;
         self.current_reverb_pct +=
@@ -619,32 +677,12 @@ pub struct SpatialAudioEngine {
     front_right_to_l: RealTimeOverlapSave,  // 9 -> left ear
     front_right_to_r: RealTimeOverlapSave,  // 9 -> right ear,
 
-    // EARLY REFLECTIONS, cross-ear complete:
-    //   left-rear 40  -> BOTH ears (H40_L, H40_R)
-    //   right-rear 32 -> BOTH ears (H32_L, H32_R)
-    //
-    // Mid and Side retain independent convolution state.
-    // Rear-source polarity remains:
-    //   left-rear  = Mid + Side
-    //   right-rear = Mid - Side
-    mid_er_left_to_l: RealTimeOverlapSave,
-    mid_er_left_to_r: RealTimeOverlapSave,
-    mid_er_right_to_l: RealTimeOverlapSave,
-    mid_er_right_to_r: RealTimeOverlapSave,
-
-    side_er_left_to_l: RealTimeOverlapSave,
-    side_er_left_to_r: RealTimeOverlapSave,
-    side_er_right_to_l: RealTimeOverlapSave,
-    side_er_right_to_r: RealTimeOverlapSave,
-
-    mid_er_delay_left: RealTimeDelayLine,
-    mid_er_delay_right: RealTimeDelayLine,
-    side_er_delay_left: RealTimeDelayLine,
-    side_er_delay_right: RealTimeDelayLine,
+    // Six discrete early reflections. Their delays, gains, wall absorption and
+    // direction-specific HRIR pairs are independent. ER ends around 46 ms; the
+    // FDN is pre-delayed to start around 55 ms.
+    early_reflections: [EarlyReflection; 6],
 
     // Direct HRTF cues stay full-band. Only the reflected field is darkened.
-    er_lp_l: RealTimeBiquadFilter,
-    er_lp_r: RealTimeBiquadFilter,
     side_shelf_l: RealTimeBiquadFilter,
     side_shelf_r: RealTimeBiquadFilter,
 
@@ -658,7 +696,6 @@ pub struct SpatialAudioEngine {
 
 impl SpatialAudioEngine {
     pub fn new(sr: f32, hrtf_data: &HrtfData, block_size: usize) -> Self {
-        let (b_er_lp, a_er_lp) = butter_lowpass_2nd(sr, 6500.0);
         let (b_sh, a_sh) = get_high_shelf_coeffs(sr, 2500.0, -2.5, 0.707);
 
         Self {
@@ -681,33 +718,18 @@ impl SpatialAudioEngine {
             front_right_to_l: RealTimeOverlapSave::new(&hrtf_data.front_right_to_l, block_size),
             front_right_to_r: RealTimeOverlapSave::new(&hrtf_data.front_right_to_r, block_size),
 
-            // Cross-ear-complete rear field:
-            // each rear virtual source is rendered to BOTH ears.
-            //
-            // left-rear 40 -> H40_L / H40_R
-            mid_er_left_to_l: RealTimeOverlapSave::new(&hrtf_data.rear_left_to_l, block_size),
-            mid_er_left_to_r: RealTimeOverlapSave::new(&hrtf_data.rear_left_to_r, block_size),
-            // right-rear 32 -> H32_L / H32_R
-            mid_er_right_to_l: RealTimeOverlapSave::new(&hrtf_data.rear_right_to_l, block_size),
-            mid_er_right_to_r: RealTimeOverlapSave::new(&hrtf_data.rear_right_to_r, block_size),
+            // Six first-order-ish horizontal reflection events.
+            // Indices follow the existing 64-direction horizontal HRTF set.
+            // Earlier paths are brighter/stronger; later paths are darker/weaker.
+            early_reflections: [
+                EarlyReflection::new(sr, block_size, 11.0, 0.16, 7500.0,  1.0, &hrtf_data.er_left[0], &hrtf_data.er_right[0]), // idx 56
+                EarlyReflection::new(sr, block_size, 14.0, 0.15, 7200.0, -1.0, &hrtf_data.er_left[1], &hrtf_data.er_right[1]), // idx 8
+                EarlyReflection::new(sr, block_size, 22.0, 0.13, 6200.0,  1.0, &hrtf_data.er_left[2], &hrtf_data.er_right[2]), // idx 48
+                EarlyReflection::new(sr, block_size, 27.0, 0.12, 5900.0, -1.0, &hrtf_data.er_left[3], &hrtf_data.er_right[3]), // idx 16
+                EarlyReflection::new(sr, block_size, 38.0, 0.10, 4800.0,  1.0, &hrtf_data.er_left[4], &hrtf_data.er_right[4]), // idx 40
+                EarlyReflection::new(sr, block_size, 46.0, 0.09, 4500.0, -1.0, &hrtf_data.er_left[5], &hrtf_data.er_right[5]), // idx 32
+            ],
 
-            // Side needs independent overlap-save state even with identical HRIRs.
-            side_er_left_to_l: RealTimeOverlapSave::new(&hrtf_data.rear_left_to_l, block_size),
-            side_er_left_to_r: RealTimeOverlapSave::new(&hrtf_data.rear_left_to_r, block_size),
-            side_er_right_to_l: RealTimeOverlapSave::new(&hrtf_data.rear_right_to_l, block_size),
-            side_er_right_to_r: RealTimeOverlapSave::new(&hrtf_data.rear_right_to_r, block_size),
-
-            // Left-rear is slightly later than right-rear, preserving the
-            // asymmetry from the original 23 ms / 18 ms design.
-            mid_er_delay_left: RealTimeDelayLine::new(sr, 23.0, 0.80, 5500.0),
-            mid_er_delay_right: RealTimeDelayLine::new(sr, 18.0, 0.80, 5500.0),
-            // Side ER is kept a little lower than Mid ER so rear width does not
-            // dominate the front image.
-            side_er_delay_left: RealTimeDelayLine::new(sr, 23.0, 0.70, 5200.0),
-            side_er_delay_right: RealTimeDelayLine::new(sr, 18.0, 0.40, 5200.0),
-
-            er_lp_l: RealTimeBiquadFilter::new(b_er_lp, a_er_lp),
-            er_lp_r: RealTimeBiquadFilter::new(b_er_lp, a_er_lp),
             side_shelf_l: RealTimeBiquadFilter::new(b_sh, a_sh),
             side_shelf_r: RealTimeBiquadFilter::new(b_sh, a_sh),
             late_reverb: StereoFdnReverb::new(sr),
@@ -788,51 +810,19 @@ impl SpatialAudioEngine {
         let side_direct_l = self.side_shelf_l.process(&side_l_raw);
         let side_direct_r = self.side_shelf_r.process(&side_r_raw);
 
-        // 4) MID EARLY REFLECTION
-        // Two rear virtual sources:
-        //   left-rear 40  = 23 ms path
-        //   right-rear 32 = 18 ms path
-        let mid_er_src_left = self.mid_er_delay_left.process(&mid_eq);
-        let mid_er_src_right = self.mid_er_delay_right.process(&mid_eq);
-
-        // Every rear source reaches BOTH ears.
-        let mid_40_l = self.mid_er_left_to_l.process(&mid_er_src_left);
-        let mid_40_r = self.mid_er_left_to_r.process(&mid_er_src_left);
-        let mid_32_l = self.mid_er_right_to_l.process(&mid_er_src_right);
-        let mid_32_r = self.mid_er_right_to_r.process(&mid_er_src_right);
-
-        // 5) SIDE EARLY REFLECTION
-        let side_er_src_left = self.side_er_delay_left.process(&side_eq);
-        let side_er_src_right = self.side_er_delay_right.process(&side_eq);
-
-        let side_40_l = self.side_er_left_to_l.process(&side_er_src_left);
-        let side_40_r = self.side_er_left_to_r.process(&side_er_src_left);
-        let side_32_l = self.side_er_right_to_l.process(&side_er_src_right);
-        let side_32_r = self.side_er_right_to_r.process(&side_er_src_right);
-
-        // Preserve M/S polarity at the two rear virtual sources:
-        //   left-rear 40  = Mid + Side
-        //   right-rear 32 = Mid - Side
-        //
-        // Then sum BOTH rear sources at EACH ear:
-        //   ear L = M40_L + S40_L + M32_L - S32_L
-        //   ear R = M40_R + S40_R + M32_R - S32_R
-        let mut er_l_raw = Vec::with_capacity(n);
-        let mut er_r_raw = Vec::with_capacity(n);
-        for i in 0..n {
-            er_l_raw.push(
-                mid_40_l[i] + side_40_l[i]
-                    + mid_32_l[i] - side_32_l[i]
-            );
-            er_r_raw.push(
-                mid_40_r[i] + side_40_r[i]
-                    + mid_32_r[i] - side_32_r[i]
-            );
+        // 4/5) SIX DISCRETE EARLY REFLECTIONS
+        // Each event is delayed, wall-filtered and rendered to BOTH ears using
+        // the HRIR pair for that event direction. Summing several modest events
+        // avoids the "one huge delayed loudspeaker" character of the old 2-path ER.
+        let mut er_l = vec![0.0_f32; n];
+        let mut er_r = vec![0.0_f32; n];
+        for reflection in self.early_reflections.iter_mut() {
+            let (rl, rr) = reflection.process(&mid_eq, &side_eq);
+            for i in 0..n {
+                er_l[i] += rl[i];
+                er_r[i] += rr[i];
+            }
         }
-
-        // Darken reflections only. Direct HRTF pinna cues remain full-band.
-        let er_l = self.er_lp_l.process(&er_l_raw);
-        let er_r = self.er_lp_r.process(&er_r_raw);
 
         // 6) LATE REVERB: both Mid and Side energize the FDN using orthogonal
         // injection patterns, so stereo-only material still creates a tail.
@@ -880,11 +870,10 @@ pub struct HrtfData {
     pub front_left_to_r: Vec<f32>,   // left-front 63 -> right ear
     pub front_right_to_l: Vec<f32>,  // right-front 9 -> left ear
     pub front_right_to_r: Vec<f32>,  // right-front 9 -> right ear
-    // Cross-ear-complete rear HRIR pairs.
-    pub rear_left_to_l: Vec<f32>,   // rear-left 40 -> left ear
-    pub rear_left_to_r: Vec<f32>,   // rear-left 40 -> right ear
-    pub rear_right_to_l: Vec<f32>,  // rear-right 32 -> left ear
-    pub rear_right_to_r: Vec<f32>,  // rear-right 32 -> right ear
+    // Direction-specific HRIR pairs for six early-reflection events.
+    // Event direction indices: [56, 8, 48, 16, 40, 32].
+    pub er_left: [Vec<f32>; 6],
+    pub er_right: [Vec<f32>; 6],
 }
 
 
@@ -982,33 +971,40 @@ fn main() {
     // 今回はテスト実行を回すため、ダミーの配列（すべて0.0）で構造体を初期化します。
     let hrtf_data = HrtfData {
         // front 0 -> BOTH ears
-        left_0: load_impulse_response("hrtf_0.wav")
+        left_0: load_impulse_response("hrtf_left_0.wav")
             .unwrap_or(vec![0.0; 512]),
-        right_0: load_impulse_response("hrtf_0.wav")
+        right_0: load_impulse_response("hrtf_right_0.wav")
             .unwrap_or(vec![0.0; 512]),
 
         // left-front 63 -> BOTH ears
-        front_left_to_l: load_impulse_response("hrtf_59.wav")
+        front_left_to_l: load_impulse_response("hrtf_left_63.wav")
             .unwrap_or(vec![0.0; 512]),
-        front_left_to_r: load_impulse_response("hrtf_59.wav")
+        front_left_to_r: load_impulse_response("hrtf_right_63.wav")
             .unwrap_or(vec![0.0; 512]),
 
         // right-front 9 -> BOTH ears
-        front_right_to_l: load_impulse_response("hrtf_18.wav")
+        front_right_to_l: load_impulse_response("hrtf_left_9.wav")
             .unwrap_or(vec![0.0; 512]),
-        front_right_to_r: load_impulse_response("hrtf_18.wav")
+        front_right_to_r: load_impulse_response("hrtf_right_9.wav")
             .unwrap_or(vec![0.0; 512]),
-        // rear-left virtual source (index 40) -> BOTH ears
-        rear_left_to_l: load_impulse_response("hrtf_left_40.wav")
-            .unwrap_or(vec![0.0; 512]),
-        rear_left_to_r: load_impulse_response("hrtf_left_40.wav")
-            .unwrap_or(vec![0.0; 512]),
-
-        // rear-right virtual source (index 32) -> BOTH ears
-        rear_right_to_l: load_impulse_response("hrtf_right_32.wav")
-            .unwrap_or(vec![0.0; 512]),
-        rear_right_to_r: load_impulse_response("hrtf_right_32.wav")
-            .unwrap_or(vec![0.0; 512]),
+        // Six ER directions -> BOTH ears.
+        // [56, 8, 48, 16, 40, 32]
+        er_left: [
+            load_impulse_response("hrtf_left_56.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_left_8.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_left_48.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_left_16.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_left_40.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_left_32.wav").unwrap_or(vec![0.0; 512]),
+        ],
+        er_right: [
+            load_impulse_response("hrtf_right_56.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_right_8.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_right_48.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_right_16.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_right_40.wav").unwrap_or(vec![0.0; 512]),
+            load_impulse_response("hrtf_right_32.wav").unwrap_or(vec![0.0; 512]),
+        ],
     };
     println!("✅ HRTFデータ準備完了");
 

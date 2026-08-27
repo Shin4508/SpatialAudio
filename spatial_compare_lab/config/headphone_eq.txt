@@ -1,0 +1,15 @@
+# Headphone compensation profile
+#
+# Format:
+#   CHANNEL TYPE FREQ_HZ GAIN_DB Q
+#
+# CHANNEL: B = both ears, L = left only, R = right only
+# TYPE: peaking | low_shelf | high_shelf
+#
+# No filters are active by default because compensation without a measured
+# headphone response would be arbitrary.
+#
+# Example only (leave commented unless it matches your measured target):
+# B low_shelf 100 1.5 0.707
+# B peaking 3200 -2.0 1.2
+# B high_shelf 9000 -1.0 0.707

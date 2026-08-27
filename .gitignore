@@ -1,10 +1,29 @@
-data/
+# macOS metadata
 .DS_Store
-Target/
-hrtf_left_9.wav
-hrtf_right_9.wav
-hrtf_left_63.wav
-hrtf_right_9.wav
-hrtf_left_40.wav
-hrtf_right_32.wav
-output.wav
+
+# Rust build artifacts
+**/target/
+
+# Python environments and caches
+**/.venv/
+**/venv/
+**/__pycache__/
+*.py[cod]
+
+# Local HRTF database (large external dataset)
+/data/
+
+# Generated renderer outputs and local source recordings
+**/output.wav
+**/final_rt_sim.wav
+/spatial_compare_lab/compare_out/
+/spatial_compare_lab/mp3_renders/
+/spatial_compare_lab/originals/
+
+# Generated scratch HRTF exports used by the older prototypes
+/mat_to_bin/hrtf_left_*.wav
+/mat_to_bin/hrtf_right_*.wav
+/rasberry_pi/hrtf_left_*.wav
+/rasberry_pi/hrtf_right_*.wav
+/rust_impl/hrtf_left_*.wav
+/rust_impl/hrtf_right_*.wav
