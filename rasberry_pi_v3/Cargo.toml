@@ -1,0 +1,23 @@
+[package]
+name = "rasberry_pi_v3"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[features]
+default = ["live"]
+live = ["dep:jack"]
+
+[dependencies]
+jack = { version = "0.13.5", optional = true }
+rustfft = "6.2"
+spatial_compare_lab_v2 = { path = "../spatial_compare_lab_v2" }
+
+[dev-dependencies]
+hound = "3.5"
+tempfile = "3"
+
+[[bin]]
+name = "rasberry_pi_v3"
+path = "src/main.rs"
+required-features = ["live"]

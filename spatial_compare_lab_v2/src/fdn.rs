@@ -88,12 +88,41 @@ impl StereoFdn {
         send: f32,
     ) -> (Vec<f32>, Vec<f32>) {
         let n = left.len().min(right.len());
-        if !self.enabled {
-            return (vec![0.0; n], vec![0.0; n]);
-        }
-
         let mut out_l = vec![0.0_f32; n];
         let mut out_r = vec![0.0_f32; n];
+        self.process_into(&left[..n], &right[..n], send, &mut out_l, &mut out_r);
+        (out_l, out_r)
+    }
+
+    /// Clear delay state without allocating, for restarting an inactive room.
+    pub fn reset(&mut self) {
+        for d in &mut self.delays {
+            d.buffer.fill(0.0);
+            d.idx = 0;
+            d.damp = 0.0;
+        }
+        self.predelay.fill([0.0; 2]);
+        self.predelay_idx = 0;
+    }
+
+    /// Identical DSP to `process_block`, using caller-owned output buffers.
+    pub fn process_into(
+        &mut self,
+        left: &[f32],
+        right: &[f32],
+        send: f32,
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+    ) {
+        let n = left.len();
+        assert_eq!(right.len(), n);
+        assert_eq!(out_l.len(), n);
+        assert_eq!(out_r.len(), n);
+        if !self.enabled {
+            out_l.fill(0.0);
+            out_r.fill(0.0);
+            return;
+        }
         let mid_pattern = [1.0_f32, 1.0, 1.0, 1.0];
         let side_pattern = [1.0_f32, -1.0, -1.0, 1.0];
 
@@ -139,8 +168,6 @@ impl StereoFdn {
             out_l[i] = (d[0] + d[2]) * 0.70710678 * self.output_gain;
             out_r[i] = (d[1] + d[3]) * 0.70710678 * self.output_gain;
         }
-
-        (out_l, out_r)
     }
 }
 

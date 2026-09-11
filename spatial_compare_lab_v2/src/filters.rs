@@ -12,6 +12,11 @@ pub struct Biquad {
 }
 
 impl Biquad {
+    pub fn reset(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
+
     pub fn new(b: [f32; 3], a: [f32; 3]) -> Self {
         Self {
             b,

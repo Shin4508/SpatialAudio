@@ -99,6 +99,12 @@ pub struct HeadphoneEq {
 }
 
 impl HeadphoneEq {
+    pub fn reset(&mut self) {
+        for filter in self.left.iter_mut().chain(&mut self.right) {
+            filter.reset();
+        }
+    }
+
     pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         for x in left.iter_mut() {
             let mut y = *x;

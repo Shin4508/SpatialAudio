@@ -12,6 +12,8 @@ Open <http://127.0.0.1:3000>. See [web setup and controls](web/README.md) for su
 
 For a single-mode electronics bring-up, see the [electronic module candidate showcase](electronic_module/CANDIDATES.md) and run the [single-mode runner](electronic_module/README.md).
 
+For Raspberry Pi 5 live processing with terminal switching between all seven fixed `06` rooms, see [rasberry_pi_v3 setup and commands](rasberry_pi_v3/README.md). It supports 44.1 and 48 kHz JACK/PipeWire servers.
+
 An offline Rust laboratory for comparing binaural rendering strategies on the same stereo recording. The main project, [`spatial_compare_lab`](spatial_compare_lab), renders a dry reference, unmodified-HRTF virtual loudspeakers, headphone compensation, six acoustic environments, optional personal HRTFs, and content-adaptive variants.
 
 The goal is to make spatial-audio decisions audible and measurable before moving the processing to a real-time or embedded target such as the ESP32-S3.
