@@ -41,7 +41,7 @@ pw-link -io
 jack_lsp
 ```
 
-The program uses the default input and output devices. Select a different device through the JACK/PipeWire default or an ALSA device profile before launching. Use a 48 kHz stereo float32 path; the included HRTFs are 48 kHz.
+The program uses the default input and output devices, but explicitly requests a 48 kHz stereo float32 stream. This is intentional because your Pi may report 44.1 kHz as its system default while the included HRTFs are 48 kHz. The default can remain 44.1 kHz as long as the codec advertises 48 kHz as a supported rate. Select a different device through the JACK/PipeWire default or an ALSA device profile before launching.
 
 ## Run one mode
 
@@ -88,4 +88,4 @@ cargo test --locked --manifest-path spatial_compare_lab_v2/Cargo.toml
 cargo check --locked --manifest-path rasberry_pi_v2/Cargo.toml --bin 08g_concertgebouw_adaptive
 ```
 
-Start at a low headphone volume. Watch `pw-top` or `jack_iodelay` for XRUNs. If the callback misses deadlines, use a larger period (`-p 512`), close other audio clients, and keep the fixed 48 kHz/256-sample configuration while profiling. The callback currently keeps state behind a mutex and the v2 FFT path still allocates temporary vectors; this is deliberate for a first Pi 5 reference and must be optimized before moving the exact design to an MCU.
+Start at a low headphone volume. Watch `pw-top` or `jack_iodelay` for XRUNs. If the device exposes only 44.1 kHz, select a codec profile that supports 48 kHz or regenerate the complete HRTF profile at 44.1 kHz; do not mix 44.1 kHz audio with the included 48 kHz HRIRs. If the callback misses deadlines, use a larger period (`-p 512`), close other audio clients, and keep the fixed 48 kHz/256-sample configuration while profiling. The callback currently keeps state behind a mutex and the v2 FFT path still allocates temporary vectors; this is deliberate for a first Pi 5 reference and must be optimized before moving the exact design to an MCU.

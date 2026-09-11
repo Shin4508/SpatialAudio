@@ -3,6 +3,7 @@
 //! The expensive room bake happens before the audio streams start. The audio
 //! callback then runs one fixed 256-sample mode and never changes rooms.
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{SampleFormat, SampleRate, StreamConfig};
 use spatial_compare_lab_v2::{
     adaptive::AdaptiveController,
     fdn::StereoFdn,
@@ -135,20 +136,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output = host
         .default_output_device()
         .ok_or("No default output device")?;
-    let in_cfg = input.default_input_config()?;
-    let out_cfg = output.default_output_config()?;
-    if in_cfg.sample_format() != cpal::SampleFormat::F32
-        || out_cfg.sample_format() != cpal::SampleFormat::F32
-    {
-        return Err("Select f32 CPAL devices (set JACK/PipeWire format to float32)".into());
-    }
-    if in_cfg.channels() < 2 || out_cfg.channels() < 2 {
-        return Err("Stereo input and output are required".into());
-    }
-    if in_cfg.sample_rate() != out_cfg.sample_rate() {
+    // The bundled HRIRs are 48 kHz. Explicitly choose that rate even when
+    // PipeWire/ALSA reports 44.1 kHz as the system default.
+    let in_cfg = choose_config(&input, true)?;
+    let out_cfg = choose_config(&output, false)?;
+    if in_cfg.sample_rate != out_cfg.sample_rate {
         return Err("Input/output sample rates differ".into());
     }
-    let sr = in_cfg.sample_rate().0;
+    let sr = in_cfg.sample_rate.0;
     let profile = HrtfProfile::load(profile_path.to_str().ok_or("Invalid HRTF_PROFILE")?)?;
     if profile.sample_rate != sr {
         return Err(format!(
@@ -163,10 +158,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     )));
     let input_queue = Arc::clone(&queue);
     let input_stream = input.build_input_stream(
-        &in_cfg.config(),
+        &in_cfg,
         move |data: &[f32], _| {
             if let Ok(mut q) = input_queue.lock() {
-                for frame in data.chunks(in_cfg.channels() as usize) {
+                for frame in data.chunks(2) {
                     if frame.len() >= 2 {
                         q.push_back((frame[0], frame[1]));
                     }
@@ -178,9 +173,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let output_queue = Arc::clone(&queue);
     let output_engine = Arc::clone(&engine);
-    let channels = out_cfg.channels() as usize;
+    let channels = 2usize;
     let output_stream = output.build_output_stream(
-        &out_cfg.config(),
+        &out_cfg,
         move |data: &mut [f32], _| {
             if let (Ok(mut q), Ok(mut e)) = (output_queue.lock(), output_engine.lock()) {
                 for frame in data.chunks_mut(channels) {
@@ -209,4 +204,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+}
+
+fn choose_config(device: &cpal::Device, input: bool) -> Result<StreamConfig, Box<dyn Error>> {
+    let ranges = if input {
+        device.supported_input_configs()?.collect::<Vec<_>>()
+    } else {
+        device.supported_output_configs()?.collect::<Vec<_>>()
+    };
+    let range = ranges
+        .into_iter()
+        .find(|r| {
+            r.channels() >= 2
+                && r.sample_format() == SampleFormat::F32
+                && r.min_sample_rate().0 <= 48_000
+                && r.max_sample_rate().0 >= 48_000
+        })
+        .ok_or("No stereo float32 48 kHz stream is available")?;
+    let mut config = range.with_sample_rate(SampleRate(48_000)).config();
+    config.channels = 2;
+    Ok(config)
 }
