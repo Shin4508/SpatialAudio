@@ -1,5 +1,16 @@
 # Spatial Sound
 
+## Web interface
+
+Upload music, edit environment parameters, and play or download spatial audio using the HTML/CSS/JavaScript frontend and Rust backend:
+
+```sh
+cargo run --release --locked --manifest-path web/Cargo.toml
+```
+
+Open <http://127.0.0.1:3000>. See [web setup and controls](web/README.md) for supported formats and HRTF configuration.
+
+
 A Rust experiment for converting stereo audio into a binaural spatial mix with HRTF convolution, Mid/Side processing, room reflections, reverb, distance filtering, and headphone crossfeed.
 
 The project currently has two main implementations:
@@ -210,3 +221,7 @@ cargo check --manifest-path rasberry_pi_v2/Cargo.toml
 ```
 
 The directory name `rasberry_pi_v2` preserves the spelling used by the existing project.
+
+## License
+
+Project code is licensed under the [Apache License 2.0](LICENSE), using the [official license text](https://www.apache.org/licenses/LICENSE-2.0.txt). Third-party dependencies, HRTF datasets, and music retain their own licenses.
