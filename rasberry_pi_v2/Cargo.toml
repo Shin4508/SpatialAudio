@@ -10,3 +10,4 @@ ringbuf = "0.4.1"
 rustfft = "6.1"
 num-complex = "0.4"
 hound = "3.5"
+spatial_compare_lab_v2 = { path = "../spatial_compare_lab_v2" }
