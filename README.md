@@ -1,4 +1,4 @@
-# Spatial Sound
+# Spatial Sound Comparison Lab
 
 ## Web interface
 
@@ -10,217 +10,232 @@ cargo run --release --locked --manifest-path web/Cargo.toml
 
 Open <http://127.0.0.1:3000>. See [web setup and controls](web/README.md) for supported formats and HRTF configuration.
 
+For a single-mode electronics bring-up, see the [electronic module candidate showcase](electronic_module/CANDIDATES.md) and run the [single-mode runner](electronic_module/README.md).
 
-A Rust experiment for converting stereo audio into a binaural spatial mix with HRTF convolution, Mid/Side processing, room reflections, reverb, distance filtering, and headphone crossfeed.
+An offline Rust laboratory for comparing binaural rendering strategies on the same stereo recording. The main project, [`spatial_compare_lab`](spatial_compare_lab), renders a dry reference, unmodified-HRTF virtual loudspeakers, headphone compensation, six acoustic environments, optional personal HRTFs, and content-adaptive variants.
 
-The project currently has two main implementations:
+The goal is to make spatial-audio decisions audible and measurable before moving the processing to a real-time or embedded target such as the ESP32-S3.
 
-| Directory | Mode | Purpose |
+## What it compares
+
+The renderer treats the input channels as virtual loudspeakers at approximately -30° and +30°. Each loudspeaker is rendered to both ears through a 72-direction horizontal HRTF profile.
+
+The comparison stages are:
+
+1. Dry stereo input.
+2. Full-strength HRTF virtual loudspeakers.
+3. Optional per-ear parametric headphone EQ.
+4. Baked early reflections and late reverberation for six environments while keeping the direct HRTFs unchanged.
+5. An optional personal HRTF profile.
+6. Content-adaptive room rendering based on channel correlation and Mid/Side energy.
+
+```text
+Stereo WAV
+  ├─> dry reference
+  └─> two virtual loudspeakers
+        ├─> direct HRTF paths (speaker × ear)
+        ├─> image-source early reflections
+        ├─> stereo FDN late field
+        ├─> optional headphone EQ
+        └─> clipping prevention
+              └─> 32-bit float comparison WAVs
+```
+
+## Why the renderer is bake-oriented
+
+Room geometry and HRTF lookup are performed before audio blocks are processed. For each environment, the room baker creates four direct filters and four early-reflection filters:
+
+- left speaker to left ear
+- left speaker to right ear
+- right speaker to left ear
+- right speaker to right ear
+
+This separates expensive geometry work from the runtime signal path. The desktop implementation currently uses FFT convolution, while the baked filters and lightweight adaptive controller are intended to be portable to an embedded FIR/FFT implementation later.
+
+## Requirements
+
+- Rust and Cargo
+- A stereo WAV input
+- An HRTF profile whose sample rate matches the input
+
+The included default profile is tagged as 48 kHz, so use a 48 kHz input unless you regenerate the profile with the correct sample-rate metadata.
+
+## Quick start
+
+Place a stereo input at `spatial_compare_lab/output.wav`, then run the program from that directory:
+
+```bash
+cd spatial_compare_lab
+cargo run --release
+```
+
+You can also provide all paths explicitly:
+
+```bash
+cd spatial_compare_lab
+cargo run --release -- \
+  /path/to/input.wav \
+  hrtf_profiles/default \
+  hrtf_profiles/personal \
+  config/headphone_eq.txt
+```
+
+Arguments are positional and ordered as follows:
+
+| Position | Default | Purpose |
 | --- | --- | --- |
-| `rust_impl` | Offline | Processes a stereo WAV file and writes a rendered WAV file |
-| `rasberry_pi_v2` | Real time | Processes live stereo audio through JACK on a Raspberry Pi/Linux system |
+| 1 | `output.wav` | Stereo source WAV |
+| 2 | `hrtf_profiles/default` | Complete default HRTF profile |
+| 3 | `hrtf_profiles/personal` | Optional personal HRTF profile |
+| 4 | `config/headphone_eq.txt` | Per-ear headphone EQ configuration |
 
-Both implementations are prototypes. They use fixed settings and file names defined in their respective `main.rs` files.
+All output is written to `spatial_compare_lab/compare_out/` when the command is run from the project directory.
 
-## How it works
+## Comparison outputs
 
-The renderer converts the stereo input into Mid and Side signals:
-
-```text
-Mid  = (Left + Right) / 2
-Side = (Left - Right) / 2
-```
-
-The Mid signal represents the center image, while the Side signal represents stereo width. Different HRTF impulse responses are applied to these components to position them around the listener.
-
-The general processing flow is:
+Every run creates these baseline files:
 
 ```text
-Stereo input
-  -> Mid/Side encoding
-  -> dynamic EQ and crossover
-  -> HRTF convolution
-  -> early reflections
-  -> late reverb
-  -> crossfeed
-  -> soft clipping
-  -> binaural stereo output
+compare_out/00_dry.wav
+compare_out/01_reference_2speaker.wav
+compare_out/02_hrtf_intensity_090.wav
+compare_out/05_headphone_comp.wav
 ```
 
-FFT overlap-save convolution is implemented with `rustfft`. WAV files are read with `hound`, and live audio is handled by `cpal`.
+It also creates fixed and adaptive renders for each environment:
 
-## Offline renderer: `rust_impl`
-
-The offline implementation reads a stereo WAV file, processes it in blocks of 128 frames, and writes the result to `final_rt_sim.wav`.
-
-Its processing chain includes:
-
-- Mid/Side encoding
-- adaptive low-frequency shelf EQ
-- 120 Hz low/high crossover
-- HRTF convolution for the direct sound
-- 18 ms and 23 ms delayed rear reflections
-- low-pass filtering of the reflected field
-- 70% processed and 30% original signal blending
-- 0.5 ms crossfeed
-- `tanh` soft clipping
-
-### Required files
-
-The executable looks for the following files in its working directory:
-
-```text
-output.wav
-hrtf_left_9.wav
-hrtf_right_9.wav
-hrtf_left_63.wav
-hrtf_left_40.wav
-hrtf_right_32.wav
-```
-
-`output.wav` must be stereo 16-bit PCM. The HRTF files are read as mono 32-bit floating-point WAV files.
-
-The included audio files are stored in subdirectories, so copy them into `rust_impl` before running:
-
-```bash
-cd rust_impl
-cp src/output.wav .
-cp hrtf_wav/*.wav .
-cargo run --release
-```
-
-Output:
-
-```text
-rust_impl/final_rt_sim.wav
-```
-
-If an HRTF file cannot be loaded, the offline renderer substitutes a silent impulse response. If `output.wav` is missing or has an unsupported sample format, the program exits.
-
-The final incomplete block is not processed, so the last 127 frames or fewer may be silent.
-
-## Real-time renderer: `rasberry_pi_v2`
-
-The real-time implementation is designed for a Raspberry Pi or another Linux system running JACK, optionally through PipeWire's JACK compatibility layer.
-
-It receives live stereo input, processes the audio inside the output callback, and sends the resulting binaural signal to the default JACK output device.
-
-Compared with `rust_impl`, this version adds:
-
-- a fourth-order Linkwitz-Riley crossover at 100 Hz
-- smoothed Mid/Side width control
-- distance-based volume and spectral attenuation
-- adaptive early-reflection and late-reverb levels
-- separate Mid and Side reflection paths
-- a four-line feedback delay network reverb
-- improved full-band direct HRTF rendering
-
-### HRTF layout
-
-Place these files directly inside `rasberry_pi_v2`:
-
-| File | Use |
+| Prefix | Environment |
 | --- | --- |
-| `hrtf_left_0.wav` | Front source, left ear |
-| `hrtf_right_0.wav` | Front source, right ear |
-| `hrtf_left_63.wav` | Left-front Side source |
-| `hrtf_right_9.wav` | Right-front Side source |
-| `hrtf_left_40.wav` | Left-rear reflection |
-| `hrtf_right_32.wav` | Right-rear reflection |
+| `06a` / `08a` | Open air |
+| `06b` / `08b` | Street |
+| `06c` / `08c` | Recording studio |
+| `06d` / `08d` | Wood jazz club |
+| `06e` / `08e` | Piano hall |
+| `06f` / `08f` | Theater |
 
-The HRTFs must be mono 32-bit floating-point WAV files. Their sample rate should match the JACK device sample rate because the engine does not perform resampling.
+The `06` files use fixed room settings. The `08` files add content adaptation. If `hrtf_profiles/personal/hrtf_left_0.wav` exists and the personal profile is complete, the renderer also writes:
 
-The repository does not currently contain `hrtf_left_0.wav` or `hrtf_right_0.wav`. Missing HRTFs are replaced with silence, which means missing front responses will remove most of the centered direct field.
-
-### System requirements
-
-- A Raspberry Pi or Linux computer
-- Rust with Edition 2024 support
-- JACK development headers
-- A running JACK server or PipeWire JACK compatibility layer
-- `pw-link` for the automatic port-routing script
-- Stereo input and output devices
-
-Example packages for Raspberry Pi OS or Debian:
-
-```bash
-sudo apt update
-sudo apt install build-essential pkg-config libjack-jackd2-dev pipewire-jack pipewire-bin
+```text
+compare_out/07_personal_jazz_club.wav
 ```
 
-### Build and run
+For useful A/B listening, begin with `00`, then compare `01`, `02`, and `05` before moving through matching `06` and `08` environment pairs.
 
-Start the JACK-compatible audio server, place the HRTF files in the crate directory, and run:
+## Rendering stages
 
-```bash
-cd rasberry_pi_v2
-cargo run --release
+### Virtual loudspeaker reference
+
+`01_reference_2speaker.wav` uses the measured HRTFs without spectral blending, room effects, or headphone EQ. It is the clean binaural baseline:
+
+```text
+Input L -> virtual speaker at -30° -> both ears
+Input R -> virtual speaker at +30° -> both ears
 ```
 
-The process runs until interrupted with `Ctrl+C`.
+### 90% HRTF intensity
 
-### Hardware configuration
+`02_hrtf_intensity_090.wav` blends each direct HRIR by 10% toward an energy-matched impulse at its principal arrival time. This comparison softens HRTF spectral coloration slightly while retaining the main timing and level cues. Room renders continue to use the original, unmodified HRTFs.
 
-The current code is configured for the original development setup rather than a generic Raspberry Pi installation. Before running it on different hardware, review `rasberry_pi_v2/src/main.rs`.
+### Headphone compensation
 
-The following values are hard-coded:
+`05_headphone_comp.wav` enables the EQ engine. The supplied configuration is intentionally flat. Add filters only from a measured response or a known correction target.
 
-- JACK is selected explicitly as the CPAL host.
-- Audio is assumed to be interleaved stereo `f32`.
-- The target virtual distance is fixed at 1.5 metres.
-- The HRTF engine is initialized with a 256-frame block size.
-- Bluetooth input ports are discovered using a `bluez_input` name pattern.
-- Input is connected to `cpal_client_in:in_0` and `cpal_client_in:in_1`.
-- A specific Creative Sound Blaster output connection is disconnected.
+Each non-comment line in `config/headphone_eq.txt` has this format:
 
-Update or remove the embedded `pw-link` script if those port names do not match your system. You can inspect available ports with:
-
-```bash
-pw-link -io
+```text
+CHANNEL TYPE FREQUENCY_HZ GAIN_DB Q
 ```
 
-The output callback uses the audio server's callback length, while the convolution engines are initialized for 256 frames. Configure JACK to use the expected buffer size before running the current implementation.
+`CHANNEL` is `L`, `R`, or `B` for both ears. Supported filter types are `peaking`, `low_shelf`, and `high_shelf`.
 
-## Real-time signal path
+### Acoustic environments
 
-The Raspberry Pi engine processes each block in the following order:
+The room baker uses source/listener geometry, frequency-dependent surface absorption, scattering, air loss, and image sources. It selects the strongest early events within each preset's time window, then derives or applies late-field parameters for the stereo feedback delay network.
 
-1. Encode stereo input into Mid and Side.
-2. Apply distance attenuation, proximity correction, and high-frequency air absorption.
-3. Apply smoothed low-frequency dynamic EQ.
-4. Keep Mid bass below 100 Hz centered.
-5. Convolve Mid with the front HRTFs.
-6. Convolve Side with the left-front and right-front HRTFs.
-7. Generate delayed rear HRTF reflections from both Mid and Side.
-8. Estimate early-reflection and reverb levels from the block's energy distribution.
-9. Generate a decorrelated late field with a four-delay FDN reverb.
-10. Add short crossfeed and apply a `tanh` output limiter.
+Environment definitions live in `spatial_compare_lab/src/room.rs` and include open-air, street, studio, jazz-club, piano-hall, and theater presets.
 
-## Important limitations
+### Content adaptation
 
-- There are no command-line options or runtime controls.
-- HRTF and input sample rates are not validated or converted.
-- WAV input formats are fixed by the code.
-- Missing HRTFs produce silence instead of stopping execution.
-- The live engine assumes stereo input and output without checking the channel count.
-- The real-time callback allocates multiple vectors and performs FFT processing, so it is not yet strictly real-time safe.
-- `rasberry_pi_v2` only builds when CPAL exposes its JACK backend. It will not build as written on macOS or on Linux without JACK support.
+Every 256 samples, the adaptive controller estimates:
 
-## Development
+- left/right correlation
+- Mid energy
+- Side energy
 
-Check the offline implementation with:
+Coherent, center-heavy material stays more focused and dry. Wide or diffuse material receives more early-reflection gain, late-field send, and a small dry anchor. This analysis uses only energy and dot-product calculations—no source separation or neural network is required.
 
-```bash
-cargo check --manifest-path rust_impl/Cargo.toml
+## HRTF profiles
+
+The included profile contains 144 mono 32-bit float WAV files: left and right HRIRs for 72 horizontal directions.
+
+```text
+hrtf_profiles/default/
+  hrtf_left_0.wav
+  hrtf_right_0.wav
+  ...
+  hrtf_left_71.wav
+  hrtf_right_71.wav
 ```
 
-On a JACK-enabled Linux machine, check the real-time implementation with:
+The direction layout is:
+
+- 200 samples per HRIR
+- 72 directions at 5° intervals
+- index `0` is straight ahead
+- index `6` is +30°
+- index `66` is -30°
+
+The input and HRTF sample rates must match; the renderer exits on a mismatch.
+
+### Personal HRTFs
+
+Place a complete profile with the same naming scheme in `spatial_compare_lab/hrtf_profiles/personal/`. When detected, it is used for the personal jazz-club render and all adaptive environment renders.
+
+### Convert a MAT dataset
+
+The conversion utility expects `left` and `right` arrays shaped as impulse samples × directions. It requires Python with NumPy, SciPy, and SoundFile.
 
 ```bash
-cargo check --manifest-path rasberry_pi_v2/Cargo.toml
+cd spatial_compare_lab
+python tools/mat_hrtf_to_wav.py /path/to/small_pinna_final.mat \
+  --output hrtf_profiles/default \
+  --sr 48000
 ```
 
-The directory name `rasberry_pi_v2` preserves the spelling used by the existing project.
+The MAT file does not provide a sample rate, so set `--sr` to the dataset's real rate rather than assuming 48 kHz.
+
+## Development and tuning
+
+Check the main project with:
+
+```bash
+cargo check --locked --manifest-path spatial_compare_lab/Cargo.toml
+```
+
+Useful parameters to change one at a time include:
+
+- speaker distance and azimuth in `spatial_compare_lab/src/room.rs`
+- room dimensions and surface materials in `spatial_compare_lab/src/room.rs`
+- early, late, and dry ranges in `spatial_compare_lab/src/adaptive.rs`
+- FDN decay, damping, predelay, and output gain
+
+A convincing early field may change externalization and room impression without producing an obvious echo, so evaluate localization, timbre, and distance as well as reverberance.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `spatial_compare_lab/` | Primary offline comparison renderer |
+| `spatial_compare_lab_sofa/` | Separate comparison renderer using the AKO536 Meta SS2 SOFA HRTF profile |
+| `spatial_compare_lab/src/` | HRTF, room, convolution, EQ, adaptive, and audio modules |
+| `spatial_compare_lab/hrtf_profiles/` | Default and optional personal HRIR sets |
+| `spatial_compare_lab/config/` | Headphone EQ configuration |
+| `spatial_compare_lab/tools/` | MAT-to-WAV conversion utility |
+| `rust_impl/` | Earlier offline rendering prototype |
+| `rasberry_pi_v2/` | JACK-based real-time Raspberry Pi/Linux prototype |
+| `ver2/` | Additional real-time experiment |
+
+Generated render directories, Cargo build artifacts, virtual environments, and the large local HRTF database are excluded by `.gitignore`.
 
 ## License
 

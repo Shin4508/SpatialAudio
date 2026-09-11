@@ -1,0 +1,10 @@
+[package]
+name = "spatial-electronic-module"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Single-mode runner for the spatial_compare_lab_v2 renderer"
+
+[dependencies]
+hound = "3.5"
+spatial_compare_lab_v2 = { path = "../spatial_compare_lab_v2" }
